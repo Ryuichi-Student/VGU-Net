@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from torch import nn
 import torch.nn.functional as F
 from vgu_modules.DoubleConv import DoubleConv
-from vgu_modules.SpatialGCN import SpatialGCN
+from vgu_modules.SpatialGCN import SpatialGCN, HydraGCN
 
 
 class VGUNet(nn.Module):
