@@ -1,18 +1,6 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# ## 玖零猴的Demo
-
-# In[4]:
-
-
 import os
 import numpy as np
 import SimpleITK as sitk
-
-
-# In[5]:
-
 
 flair_name = "_flair.nii.gz"
 t1_name = "_t1.nii.gz"
@@ -20,31 +8,11 @@ t1ce_name = "_t1ce.nii.gz"
 t2_name = "_t2.nii.gz"
 mask_name = "_seg.nii.gz"
 
-
-# In[6]:
-
 bratshgg_path = r"./datasets/2-MICCAI_BraTS_2018/MICCAI_BraTS_2018_Data_Training/HGG"
-
-
-# In[7]:
-
-
 bratslgg_path = r"./datasets/2-MICCAI_BraTS_2018/MICCAI_BraTS_2018_Data_Training/LGG"
 
-
-# In[8]:
-
-
 outputImg_path = r"./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage"
-
-
-# In[9]:
-
-
 outputMask_path = r"./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask"
-
-
-# In[10]:
 
 
 def file_name_path(file_dir, dir=True, file=False):
@@ -61,24 +29,13 @@ def file_name_path(file_dir, dir=True, file=False):
             print("files:", files)
             return files
 
-
-# In[2]:
-
-
 if not os.path.exists(outputImg_path):
     os.mkdir(outputImg_path)
 if not os.path.exists(outputMask_path):
     os.mkdir(outputMask_path)
 
-
-# In[9]:
-
-
 pathhgg_list = file_name_path(bratshgg_path)
 pathlgg_list = file_name_path(bratslgg_path)
-
-
-# In[10]:
 
 
 def normalize(slice, bottom=99, down=1):
@@ -108,143 +65,78 @@ def normalize(slice, bottom=99, down=1):
         return tmp
 
 
-# np.percentil
-# 分位数:
-# 在我们中学就有过中位数，其实中位数就是一个二分位数，取中位数左边区间的值的概率等于取其右边区间的值的概率。另外在大学的概率论课程中，另一个比较常见的是四分位数，也就是25%,50%,75%这三个切分点。
-# 分位数意义：表示了在这个样本集中从小至大排列之后小于某值的样本子集占总样本集的比例
-# 我采用了99与1这两个分位数来作为鉴定outliers分布的界限从而进行异常值的修正。这样子的修正可以以更好的准确率来得到我们理想的数据集。
-# 有点像去掉最低分去掉最高分的意思
-
-# In[11]:
-
-
 def crop_ceter(img,croph,cropw):   
-    #for n_slice in range(img.shape[0]):
     height,width = img[0].shape 
     starth = height//2-(croph//2)
     startw = width//2-(cropw//2)        
     return img[:,starth:starth+croph,startw:startw+cropw]
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
+from tqdm import tqdm
 
-# In[12]:
+# Functions to process each case
+def process_case(case_index, path_list, base_path, output_img_path, output_mask_path, flair_name, t1_name, t1ce_name, t2_name, mask_name):
+    brats_subset_path = os.path.join(base_path, str(path_list[case_index]))
+    flair_image = os.path.join(brats_subset_path, str(path_list[case_index]) + flair_name)
+    t1_image = os.path.join(brats_subset_path, str(path_list[case_index]) + t1_name)
+    t1ce_image = os.path.join(brats_subset_path, str(path_list[case_index]) + t1ce_name)
+    t2_image = os.path.join(brats_subset_path, str(path_list[case_index]) + t2_name)
+    mask_image = os.path.join(brats_subset_path, str(path_list[case_index]) + mask_name)
 
-
-for subsetindex in range(len(pathhgg_list)):
-    brats_subset_path = bratshgg_path + "/" + str(pathhgg_list[subsetindex]) + "/"
-    #获取每个病例的四个模态及Mask的路径
-    flair_image = brats_subset_path + str(pathhgg_list[subsetindex]) + flair_name
-    t1_image = brats_subset_path + str(pathhgg_list[subsetindex]) + t1_name
-    t1ce_image = brats_subset_path + str(pathhgg_list[subsetindex]) + t1ce_name
-    t2_image = brats_subset_path + str(pathhgg_list[subsetindex]) + t2_name
-    mask_image = brats_subset_path + str(pathhgg_list[subsetindex]) + mask_name
-    #获取每个病例的四个模态及Mask数据
     flair_src = sitk.ReadImage(flair_image, sitk.sitkInt16)
     t1_src = sitk.ReadImage(t1_image, sitk.sitkInt16)
     t1ce_src = sitk.ReadImage(t1ce_image, sitk.sitkInt16)
     t2_src = sitk.ReadImage(t2_image, sitk.sitkInt16)
     mask = sitk.ReadImage(mask_image, sitk.sitkUInt8)
-    #GetArrayFromImage()可用于将SimpleITK对象转换为ndarray
+
     flair_array = sitk.GetArrayFromImage(flair_src)
     t1_array = sitk.GetArrayFromImage(t1_src)
     t1ce_array = sitk.GetArrayFromImage(t1ce_src)
     t2_array = sitk.GetArrayFromImage(t2_src)
     mask_array = sitk.GetArrayFromImage(mask)
-    #对四个模态分别进行标准化,由于它们对比度不同
+
     flair_array_nor = normalize(flair_array)
     t1_array_nor = normalize(t1_array)
     t1ce_array_nor = normalize(t1ce_array)
     t2_array_nor = normalize(t2_array)
-    #裁剪(偶数才行)
-    flair_crop = crop_ceter(flair_array_nor,160,160)
-    t1_crop = crop_ceter(t1_array_nor,160,160)
-    t1ce_crop = crop_ceter(t1ce_array_nor,160,160)
-    t2_crop = crop_ceter(t2_array_nor,160,160)
-    mask_crop = crop_ceter(mask_array,160,160) 
-    print(str(pathhgg_list[subsetindex]))
-    #切片处理,并去掉没有病灶的切片
+
+    flair_crop = crop_ceter(flair_array_nor, 160, 160)
+    t1_crop = crop_ceter(t1_array_nor, 160, 160)
+    t1ce_crop = crop_ceter(t1ce_array_nor, 160, 160)
+    t2_crop = crop_ceter(t2_array_nor, 160, 160)
+    mask_crop = crop_ceter(mask_array, 160, 160)
+
     for n_slice in range(flair_crop.shape[0]):
-        if np.max(mask_crop[n_slice,:,:]) != 0:
-            maskImg = mask_crop[n_slice,:,:]
-            
-            FourModelImageArray = np.zeros((flair_crop.shape[1],flair_crop.shape[2],4),np.float)
-            flairImg = flair_crop[n_slice,:,:]
-            flairImg = flairImg.astype(np.float)
-            FourModelImageArray[:,:,0] = flairImg
-            t1Img = t1_crop[n_slice,:,:]
-            t1Img = t1Img.astype(np.float)
-            FourModelImageArray[:,:,1] = t1Img
-            t1ceImg = t1ce_crop[n_slice,:,:]
-            t1ceImg = t1ceImg.astype(np.float)
-            FourModelImageArray[:,:,2] = t1ceImg
-            t2Img = t2_crop[n_slice,:,:]
-            t2Img = t2Img.astype(np.float)
-            FourModelImageArray[:,:,3] = t2Img       
-        
-            imagepath = outputImg_path + "//" + str(pathhgg_list[subsetindex]) + "_" + str(n_slice) + ".npy"
-            maskpath = outputMask_path + "//" + str(pathhgg_list[subsetindex]) + "_" + str(n_slice) + ".npy"
-            np.save(imagepath,FourModelImageArray)#(160,160,4) np.float dtype('float64')
-            np.save(maskpath,maskImg)# (160, 160) dtype('uint8') 值为0 1 2 4
-print("Done！")
-        
-    
+        if np.max(mask_crop[n_slice, :, :]) != 0:
+            mask_img = mask_crop[n_slice, :, :]
+            FourModelImageArray = np.zeros((flair_crop.shape[1], flair_crop.shape[2], 4), np.float64)
 
+            FourModelImageArray[:, :, 0] = flair_crop[n_slice, :, :].astype(np.float64)
+            FourModelImageArray[:, :, 1] = t1_crop[n_slice, :, :].astype(np.float64)
+            FourModelImageArray[:, :, 2] = t1ce_crop[n_slice, :, :].astype(np.float64)
+            FourModelImageArray[:, :, 3] = t2_crop[n_slice, :, :].astype(np.float64)
 
-# In[13]:
+            image_path = os.path.join(output_img_path, f"{path_list[case_index]}_{n_slice}.npy")
+            mask_path = os.path.join(output_mask_path, f"{path_list[case_index]}_{n_slice}.npy")
+            np.save(image_path, FourModelImageArray)
+            np.save(mask_path, mask_img)
 
-for subsetindex in range(len(pathlgg_list)):
-    brats_subset_path = bratslgg_path + "/" + str(pathlgg_list[subsetindex]) + "/"
-    #获取每个病例的四个模态及Mask的路径
-    flair_image = brats_subset_path + str(pathlgg_list[subsetindex]) + flair_name
-    t1_image = brats_subset_path + str(pathlgg_list[subsetindex]) + t1_name
-    t1ce_image = brats_subset_path + str(pathlgg_list[subsetindex]) + t1ce_name
-    t2_image = brats_subset_path + str(pathlgg_list[subsetindex]) + t2_name
-    mask_image = brats_subset_path + str(pathlgg_list[subsetindex]) + mask_name
-    #获取每个病例的四个模态及Mask数据
-    flair_src = sitk.ReadImage(flair_image, sitk.sitkInt16)
-    t1_src = sitk.ReadImage(t1_image, sitk.sitkInt16)
-    t1ce_src = sitk.ReadImage(t1ce_image, sitk.sitkInt16)
-    t2_src = sitk.ReadImage(t2_image, sitk.sitkInt16)
-    mask = sitk.ReadImage(mask_image, sitk.sitkUInt8)
-    #GetArrayFromImage()可用于将SimpleITK对象转换为ndarray
-    flair_array = sitk.GetArrayFromImage(flair_src)
-    t1_array = sitk.GetArrayFromImage(t1_src)
-    t1ce_array = sitk.GetArrayFromImage(t1ce_src)
-    t2_array = sitk.GetArrayFromImage(t2_src)
-    mask_array = sitk.GetArrayFromImage(mask)
-    #对四个模态分别进行标准化,由于它们对比度不同
-    flair_array_nor = normalize(flair_array)
-    t1_array_nor = normalize(t1_array)
-    t1ce_array_nor = normalize(t1ce_array)
-    t2_array_nor = normalize(t2_array)
-    #裁剪(偶数才行)
-    flair_crop = crop_ceter(flair_array_nor,160,160)
-    t1_crop = crop_ceter(t1_array_nor,160,160)
-    t1ce_crop = crop_ceter(t1ce_array_nor,160,160)
-    t2_crop = crop_ceter(t2_array_nor,160,160)
-    mask_crop = crop_ceter(mask_array,160,160) 
-    print(str(pathlgg_list[subsetindex]))
-    #切片处理,并去掉没有病灶的切片
-    for n_slice in range(flair_crop.shape[0]):
-        if np.max(mask_crop[n_slice,:,:]) != 0:
-            maskImg = mask_crop[n_slice,:,:]
-            
-            FourModelImageArray = np.zeros((flair_crop.shape[1],flair_crop.shape[2],4),np.float)
-            flairImg = flair_crop[n_slice,:,:]
-            flairImg = flairImg.astype(np.float)
-            FourModelImageArray[:,:,0] = flairImg
-            t1Img = t1_crop[n_slice,:,:]
-            t1Img = t1Img.astype(np.float)
-            FourModelImageArray[:,:,1] = t1Img
-            t1ceImg = t1ce_crop[n_slice,:,:]
-            t1ceImg = t1ceImg.astype(np.float)
-            FourModelImageArray[:,:,2] = t1ceImg
-            t2Img = t2_crop[n_slice,:,:]
-            t2Img = t2Img.astype(np.float)
-            FourModelImageArray[:,:,3] = t2Img       
-        
-            imagepath = outputImg_path + "//" + str(pathlgg_list[subsetindex]) + "_" + str(n_slice) + ".npy"
-            maskpath = outputMask_path + "//" + str(pathlgg_list[subsetindex]) + "_" + str(n_slice) + ".npy"
-            np.save(imagepath,FourModelImageArray)#(160,160,4) np.float dtype('float64')
-            np.save(maskpath,maskImg)# (160, 160) dtype('uint8') 值为0 1 2 4
+    return f"Processed case {path_list[case_index]}"
+
+def process_dataset(path_list, base_path, output_img_path, output_mask_path, flair_name, t1_name, t1ce_name, t2_name, mask_name, num_workers=None):
+    if num_workers is None:
+        num_workers = cpu_count() * 2
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for index in range(len(path_list)):
+            futures.append(
+                executor.submit(process_case, index, path_list, base_path, output_img_path, output_mask_path, flair_name, t1_name, t1ce_name, t2_name, mask_name)
+            )
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing cases"):
+            pass
+
+process_dataset(pathhgg_list, bratshgg_path, outputImg_path, outputMask_path, flair_name, t1_name, t1ce_name, t2_name, mask_name)
+process_dataset(pathlgg_list, bratslgg_path, outputImg_path, outputMask_path, flair_name, t1_name, t1ce_name, t2_name, mask_name)
 print("Done!")
-

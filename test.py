@@ -87,7 +87,7 @@ def main():
     val_img_paths = img_paths
     val_mask_paths = mask_paths
 
-    print("testing moe:",args.mode)
+    print("testing mode:",args.mode)
     if args.mode == "GetPicture":
         """
         获取并保存模型生成的标签图

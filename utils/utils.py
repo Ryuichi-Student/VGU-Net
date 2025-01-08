@@ -181,6 +181,37 @@ def load_slice_img(flair_crop,t1_crop,t1ce_crop,t2_crop,mask_crop, n_slice):
 
     return npimage, nplabel
 
+class AverageMeter(object):
+    def __init__(self, device=None):
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.values = []  # Store individual values as tensors
+        self.weights = []  # Store weights (e.g., batch sizes)
+
+    def update(self, val, n=1, skip=False):
+        if skip or not torch.isfinite(val).all():
+            # print(f"Encountered {val}, skipping")
+            return True
+        # Append values and weights to the lists
+        self.values.append(val)
+        self.weights.append(n)
+        return False
+
+    def _compute(self):
+        # Perform the aggregation in one go
+        values_tensor = torch.stack(self.values).to(self.device)
+        weights_tensor = torch.tensor(self.weights, device=self.device, dtype=torch.float32)
+        total = (values_tensor * weights_tensor).sum()
+        count = weights_tensor.sum()
+        return total / count
+    
+    @property
+    def get_avg(self):
+        # Retrieve avg as a Python scalar only when needed
+        return self._compute().item()
+
 import torch
 class Slice_Dataset(torch.utils.data.Dataset):
     def __init__(self, args,num_slices,flair_crop,t1_crop,t1ce_crop,t2_crop,mask_crop):

@@ -18,9 +18,9 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from VGUNet import *
 from dataset import Dataset
-from metrics import dice_coef, batch_iou, mean_iou, iou_score
+from metrics import dice_coef, batch_iou, mean_iou, iou_score, compute_metrics
 import losses
-from utils.utils import str2bool, count_params
+from utils.utils import str2bool, count_params, AverageMeter
 import pandas as pd
 from baseline_model.vision_transformer import SwinUnet as ViT_seg
 from skimage.io import imread, imsave
@@ -28,8 +28,13 @@ import os
 from torch.nn import SyncBatchNorm
 from config import get_config
 import torch.distributed as dist
+loss_names = []
 loss_names.append('BCEWithLogitsLoss')
 
+# manual seed 0 gives pretty good results
+torch.manual_seed(0)
+torch.set_float32_matmul_precision('high')
+torch.cuda.empty_cache()
 
 def get_param_num(net):
     total = sum(p.numel() for p in net.parameters())
@@ -51,6 +56,7 @@ def parse_args():
                         help='image file extension')
     parser.add_argument('--mask-ext', default='png',
                         help='mask file extension')
+    parser.add_argument('--use-amp', default=True, type=str2bool)
     parser.add_argument('--aug', default=False, type=str2bool)
     parser.add_argument('--loss', default='BCEDiceLoss',
                         choices=loss_names,
@@ -86,34 +92,21 @@ def parse_args():
 
     return args
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
+import gc
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None):
-    losses = AverageMeter()
-    ious = AverageMeter()
+def train(args, train_loader, model, criterion, optimizer, epoch, scaler, scheduler=None):
     device = torch.device("cuda", args.local_rank)
-    model.train()
+    
+    losses = AverageMeter(device)
+    ious = AverageMeter(device)
 
+    model.train()
+    
     for i, (input, target) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        torch.cuda.synchronize()
         input = input.to(device)
         target = target.to(device)
 
-        # compute output
         if args.deepsupervision:
             outputs = model(input)
             if args.name == "dual":
@@ -125,24 +118,57 @@ def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None
             loss /= len(outputs)
             iou = iou_score(outputs[-1], target)
         else:
-            output = model(input)
-            if args.name == "dual":
-                b,c,h,w = input.shape
-                output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-            loss = criterion(output, target)
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    output = model(input)
+
+                    if args.name == "dual":
+                        b,c,h,w = input.shape
+                        output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
+
+                    loss = criterion(output, target)
+            else:
+                output = model(input)
+
+                if args.name == "dual":
+                    b,c,h,w = input.shape
+                    output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
+
+                loss = criterion(output, target)
+                
             iou = iou_score(output, target)
 
-        losses.update(loss.item(), input.size(0))
-        ious.update(iou, input.size(0))
+        skip = ious.update(iou, input.size(0))
+        if skip:
+            print(input.isfinite().all())
+            print(output.isfinite().all())
+            print(target.isfinite().all())
+            print(loss.isfinite().all())
+        losses.update(loss, input.size(0), skip=skip)
+        
+        if args.use_amp:
+            scaler.scale(loss).backward()
 
-        # compute gradient and do optimizing step
+            # Gradient clipping
+            scaler.unscale_(optimizer)  # Unscale gradients before clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            optimizer.step()
+
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        
+        if i % 100 == 99:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     log = OrderedDict([
-        ('loss', losses.avg),
-        ('iou', ious.avg),
+        ('loss', losses.get_avg),
+        ('iou', ious.get_avg),
     ])
 
     return log
@@ -165,64 +191,135 @@ def rgb_out(output):
                 rgbPic[idx, idy, 2] = 0
     return rgbPic
 
-def validate(args, val_loader, model, criterion,save_output=False):
+def validate(args, val_loader, model, criterion, save_output=False, is_test=False):
     device = torch.device("cuda", args.local_rank)
-    losses = AverageMeter()
-    ious = AverageMeter()
-    if save_output==True:
-        save_path = os.path.join("./datasets/BraTs2019/rgb_results/",args.name)
-        os.makedirs(save_path,exist_ok=True)
+    losses = AverageMeter(device)
+    ious = AverageMeter(device)
+    if is_test:
+        dice_scores = AverageMeter(device)  # For overall Dice score
+        tc_dice_scores = AverageMeter(device)  # Tumor Core Dice
+        wt_dice_scores = AverageMeter(device)  # Whole Tumor Dice
+        et_dice_scores = AverageMeter(device)  # Enhanced Tumor Dice
+        ppvs = AverageMeter(device)  # For overall Dice score
+        tc_ppvs = AverageMeter(device)  # Tumor Core Dice
+        wt_ppvs = AverageMeter(device)  # Whole Tumor Dice
+        et_ppvs = AverageMeter(device)  # Enhanced Tumor Dice
+        Hausdorff = AverageMeter(device)  # For overall Dice score
+        tc_Hausdorff = AverageMeter(device)  # Tumor Core Dice
+        wt_Hausdorff = AverageMeter(device)  # Whole Tumor Dice
+        et_Hausdorff = AverageMeter(device)  # Enhanced Tumor Dice
+
+    if save_output:
+        save_path = os.path.join("./datasets/BraTs2019/rgb_results/", args.name)
+        os.makedirs(save_path, exist_ok=True)
         img_path = os.path.join("./datasets/BraTs2019/rgb_results/", "img")
         os.makedirs(img_path, exist_ok=True)
-    # switch to evaluate mode
+
+    # Switch to evaluate mode
     model.eval()
     with torch.no_grad():
         for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
             input = input.to(device)
             target = target.to(device)
 
-            # compute output
+            # Compute output
             if args.deepsupervision:
                 outputs = model(input)
-                if args.name == "dual":
-                    b, c, h, w = input.shape
-                    output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                loss = 0
-                for output in outputs:
-                    loss += criterion(output, target)
-                loss /= len(outputs)
+                loss = sum(criterion(output, target) for output in outputs) / len(outputs)
                 iou = iou_score(outputs[-1], target)
+                pred = outputs[-1]
             else:
-                output = model(input)
-                if args.name == "dual":
-                    b, c, h, w = input.shape
-                    output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                if save_output==True:
-                    # img = rgb_out(output.squeeze())
-                    # path = os.path.join(save_path,str(i)+".png")
-                    # imsave(path,img)
-                    gt_path = os.path.join(save_path, str(i) + "gt.png")
-                    gt = rgb_out(target.squeeze())
-                    imsave(gt_path, gt)
-                loss = criterion(output, target)
-                iou = iou_score(output, target)
-                # print("save path:", iou)
+                if args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        output = model(input)
 
-            losses.update(loss.item(), input.size(0))
+                        if args.name == "dual":
+                            b,c,h,w = input.shape
+                            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
+
+                        loss = criterion(output, target)
+                else:
+                    output = model(input)
+                    loss = criterion(output, target)
+                iou = iou_score(output, target)
+                pred = output
+
+            # Save outputs if required
+            if save_output:
+                gt_path = os.path.join(save_path, str(i) + "gt.png")
+                gt = rgb_out(target.squeeze())
+                imsave(gt_path, gt)
+
+            # Update metrics
+            losses.update(loss, input.size(0))
             ious.update(iou, input.size(0))
+            
+            if is_test:
+                metrics = compute_metrics(pred, target)
+                
+                wt_dice_scores.update(torch.tensor(metrics['dice'][0], dtype=float).to(device), input.size(0))
+                tc_dice_scores.update(torch.tensor(metrics['dice'][1], dtype=float).to(device), input.size(0))
+                et_dice_scores.update(torch.tensor(metrics['dice'][2], dtype=float).to(device), input.size(0))
+                dice_scores.update(torch.tensor(metrics['dice'], dtype=float).to(device).mean(), input.size(0))
+                try:
+                    wt_Hausdorff.update(torch.tensor(metrics['hd95'][0], dtype=float).to(device), input.size(0))
+                    tc_Hausdorff.update(torch.tensor(metrics['hd95'][1], dtype=float).to(device), input.size(0))
+                    et_Hausdorff.update(torch.tensor(metrics['hd95'][2], dtype=float).to(device), input.size(0))
+                    Hausdorff.update(torch.tensor(metrics['hd95'], dtype=float).to(device).mean(), input.size(0))
+                except ValueError:
+                    pass
+                
+                wt_ppvs.update(torch.tensor(metrics['ppv'][0], dtype=float).to(device), input.size(0))
+                tc_ppvs.update(torch.tensor(metrics['ppv'][1], dtype=float).to(device), input.size(0))
+                et_ppvs.update(torch.tensor(metrics['ppv'][2], dtype=float).to(device), input.size(0))
+                ppvs.update(torch.tensor(metrics['ppv'], dtype=float).to(device).mean(), input.size(0))
 
     log = OrderedDict([
-        ('loss', losses.avg),
-        ('iou', ious.avg),
+        ('loss', losses.get_avg),
+        ('iou', ious.get_avg),
     ])
+    
+    if is_test:
+        log |= OrderedDict([
+            ('dice', dice_scores.get_avg),
+            ('wt_dice', wt_dice_scores.get_avg),
+            ('tc_dice', tc_dice_scores.get_avg),
+            ('et_dice', et_dice_scores.get_avg),
+            
+            ('ppv', ppvs.get_avg),
+            ('wt_ppv', wt_ppvs.get_avg),
+            ('tc_ppv', tc_ppvs.get_avg),
+            ('et_ppv', et_ppvs.get_avg),
+            
+            ('Hausdorff', Hausdorff.get_avg),
+            ('wt_Hausdorff', wt_Hausdorff.get_avg),
+            ('tc_Hausdorff', tc_Hausdorff.get_avg),
+            ('et_Hausdorff', et_Hausdorff.get_avg),
+        ])
 
     return log
+
 
 def main():
     args = parse_args()
     #args.dataset = "datasets"
 
     device = torch.device("cuda", args.local_rank) ########!!!!!!!!!!!
+    
+    # Data loading code
+    img_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage/*')
+    mask_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask/*')
+
+    train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
+        train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
+    print("train_num:%s"%str(len(train_img_paths)))
+    print("val_num:%s"%str(len(val_img_paths)))
+    train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
+    val_dataset = Dataset(args, val_img_paths, val_mask_paths)
+    print(f"Batch size: {args.batch_size}")
+    train_loader = torch.utils.data.DataLoader(train_dataset,num_workers=4,batch_size=args.batch_size,shuffle=True,pin_memory=True,drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset,num_workers=4,batch_size=args.batch_size,shuffle=False,pin_memory=True,drop_last=False)
+    
     if args.name is None:
         if args.deepsupervision:
             args.name = '%s_%s_wDS' %(args.dataset, args.name)
@@ -248,14 +345,6 @@ def main():
 
     cudnn.benchmark = True
 
-    # Data loading code
-    img_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage/*')
-    mask_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask/*')
-
-    train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
-        train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
-    print("train_num:%s"%str(len(train_img_paths)))
-    print("val_num:%s"%str(len(val_img_paths)))
     # create model
     print("=> creating model %s" %args.name)
     if args.name=="vgunet":
@@ -284,7 +373,7 @@ def main():
     # from torchsummary import summary
     # summary(model, input_size=(4, 160, 160))
     # 选择特定层
-    target_layers = [model.bottleneck]#,model.sgcn2,model.sgcn3]
+    target_layers = [] # [model.bottleneck]#,model.sgcn2,model.sgcn3]
 
     # 统计参数数量
 
@@ -297,50 +386,50 @@ def main():
         print("参数数量:",str(target_layer), total_params)
     print("summary:",)
     if args.pretrain==True:
-        print("usig pretrained model!!!")
-        pretrain_pth = './models/unet/'+"unet_plain91.08.pth"#str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-        pretrain_pth = './models/'+str(args.name)+'/'+str(args.name)+'_parallel_pretrained.pth'
-        pretrained_model_dict = torch.load(pretrain_pth)
-        model_dict = model.state_dict()
-        # for k, v in pretrained_model_dict.items():
-        #     print("key:", k, v)
-        pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}  # filter out unnecessary keys
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
+        model = load_vgunet(device, use_amp=args.use_amp)
+        
+    model = torch.compile(model)
     print(count_params(model))
+    
+    if args.pretrain==True:
+        val_log = validate(args, val_loader, model, criterion, is_test=True)
+
+        print(f"original: loss {val_log['loss']:.4f} - iou {val_log['iou']:.4f} - dice avg {val_log['dice']:.4f} - wt {val_log['wt_dice']:.4f} - et {val_log['et_dice']:.4f} - tc {val_log['tc_dice']:.4f}")
+        print(f"PPV SCORES: ppv avg {val_log['ppv']:.4f} - wt_ppv {val_log['wt_ppv']:.4f} - et_ppv {val_log['et_ppv']:.4f} - tc_ppv {val_log['tc_ppv']:.4f}")
+        print(f"Hausdorff: Hausdorff avg {val_log['Hausdorff']:.4f} - wt_Hausdorff {val_log['wt_Hausdorff']:.4f} - et_Hausdorff {val_log['et_Hausdorff']:.4f} - tc_Hausdorff {val_log['tc_Hausdorff']:.4f}")
+        
+    
 
     if args.optimizer == 'Adam':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+        # not 1e-8, so that we don't run into NaN errors with amp autocast.
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, eps=1e-4 if args.use_amp else 1e-8)
     elif args.optimizer == 'SGD':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr,
             momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.95, patience=3, verbose=True,min_lr=0.0000001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.95, patience=3, verbose=True,min_lr=1e-7)
 
-    train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
-    val_dataset = Dataset(args, val_img_paths, val_mask_paths)
-
-    # train_loader = torch.utils.data.DataLoader(train_dataset,batch_size=args.batch_size,shuffle=True,pin_memory=True,drop_last=True)
-    # val_loader = torch.utils.data.DataLoader(val_dataset,batch_size=args.batch_size,shuffle=False,pin_memory=True,drop_last=False)
     ##parallel
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(args.local_rank)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,shuffle=False,pin_memory=True,drop_last=False)
-    model = SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
-    print("start parallel!!")
+    # dist.init_process_group(backend='nccl')
+    # torch.cuda.set_device(args.local_rank)
+    # train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
+    # val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+    # val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,shuffle=False,pin_memory=True,drop_last=False)
+    # model = SyncBatchNorm.convert_sync_batchnorm(model)
+    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+    # print("start parallel!!")
 
     log = pd.DataFrame(index=[], columns=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
     best_iou = 0
     trigger = 0  ###triger for early stop
+    
+    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(args.epochs):
         print('Epoch [%d/%d]' %(epoch, args.epochs))
 
         # train for one epoch
-        train_log = train(args, train_loader, model, criterion, optimizer, epoch)
+        train_log = train(args, train_loader, model, criterion, optimizer, epoch, scaler)
         scheduler.step(train_log['iou'])
         # evaluate on validation set
         val_log = validate(args, val_loader, model, criterion)
@@ -357,12 +446,12 @@ def main():
             val_log['iou'],
         ], index=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
-        log = log.append(tmp, ignore_index=True)
+        log = pd.concat([log, tmp])
         log.to_csv('models/%s/log.csv' %args.name, index=False)
 
         trigger += 1
 
-        if val_log['iou'] > best_iou and torch.distributed.get_rank() == 0:####specify the first node to save the model
+        if val_log['iou'] > best_iou: # and torch.distributed.get_rank() == 0:####specify the first node to save the model
             save_pth = 'models/'+str(args.name)+'/'+str(args.name)+"_"+str(args.appdix)+'.pth'
             os.makedirs('models/'+str(args.name)+'/',exist_ok=True)
             torch.save(model.state_dict(), save_pth)
@@ -378,6 +467,32 @@ def main():
 
         torch.cuda.empty_cache()
     return 0
+
+
+def load_vgunet(device, use_amp=True, model_path="models/vgunet/vgunet_best.pth"):
+    model = VGUNet()
+    try:
+        # Load the saved state dictionary
+        state_dict = torch.load(model_path)
+
+        # Strip the "_orig_mod." prefix
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key.replace("_orig_mod.", "")  # Remove the prefix
+            new_state_dict[new_key] = value
+
+        # Load the updated state dictionary into the model
+        model.load_state_dict(new_state_dict)
+    except Exception as e:
+        print(e)
+        print(f"Failed to load model at {model_path}")
+        
+    if not use_amp:
+        model = model.float()
+            
+    return model.to(device)
+
+
 def test():
     args = parse_args()
     #args.dataset = "datasets"
@@ -412,33 +527,28 @@ def test():
 
     # Data loading code
     img_paths = glob(r'./datasets/BraTs2019/testImage/*')
+    # img_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage/*')
     mask_paths = glob(r'./datasets/BraTs2019/testMask/*')
+    # mask_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask/*')
 
-    # create model
-    if args.name == "vgunet":
-        model = VGUNet(in_ch=4, out_ch=3)
+    
     if args.name == "unet++":
         model = UNet_2Plus(in_channels=4, n_classes=3)
+        model = model.to(device)
     if args.name == "deeplabv3":
         model = DeepLabV3(class_num=3)
+        model = model.to(device)
     if args.name == "attunet":
         model = AttU_Net(img_ch=4, output_ch=3)
+        model = model.to(device)
     if args.name == "swinunet":
         config = get_config(args)
         model = ViT_seg(config,  num_classes=3)
-    model = model.to(device)
-    # pretrain_pth = "msugnet_pretrain_unet_softmax+norm_noclip_nofix.pth"#args.name+"_normal.pth"#"./models/"+args.name+"/" + args.name+"_normal.pth"##"msugnet_pretrain_on_unet89.58.pth"  # str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-    # pretrained_model_dict = torch.load(pretrain_pth)
-    # model.load_state_dict(pretrained_model_dict)
-    # if args.pretrain==True:
-    #     pretrain_pth = './models/msugnet/'+"msugnet_pretrain_on_unet_fixencoder.pth"#str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-    #     pretrained_model_dict = torch.load(pretrain_pth)
-    #     model_dict = model.state_dict()
-    #     # for k, v in pretrained_model_dict.items():
-    #     #     print("key:", k, v)
-    #     pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}  # filter out unnecessary keys
-    #     model_dict.update(pretrained_dict)
-    #     model.load_state_dict(model_dict)
+        model = model.to(device)
+    # create model
+    if args.name == "vgunet":
+        model = load_vgunet(device, use_amp=args.use_amp)
+
     print(count_params(model))
 
     test_dataset = Dataset(args, img_paths, mask_paths)
@@ -449,10 +559,11 @@ def test():
         shuffle=False,
         pin_memory=True,
         drop_last=False)
-    test_log = validate(args, test_loader, model, criterion,save_output=args.saveout)
-
-    print('loss %.4f - iou %.4f'
-        %(test_log['loss'], test_log['iou']))
+    test_log = validate(args, test_loader, model, criterion,save_output=args.saveout, is_test=True)
+    
+    print(f"loss {test_log['loss']:.4f} - iou {test_log['iou']:.4f} - dice avg {test_log['dice']:.4f} - wt {test_log['wt_dice']:.4f} - et {test_log['et_dice']:.4f} - tc {test_log['tc_dice']:.4f}")
+    print(f"PPV SCORES: ppv avg {test_log['ppv']:.4f} - wt_ppv {test_log['wt_ppv']:.4f} - et_ppv {test_log['et_ppv']:.4f} - tc_ppv {test_log['tc_ppv']:.4f}")
+    print(f"Hausdorff: Hausdorff avg {test_log['Hausdorff']:.4f} - wt_Hausdorff {test_log['wt_Hausdorff']:.4f} - et_Hausdorff {test_log['et_Hausdorff']:.4f} - tc_Hausdorff {test_log['tc_Hausdorff']:.4f}")
 
     torch.cuda.empty_cache()
 if __name__ == '__main__':

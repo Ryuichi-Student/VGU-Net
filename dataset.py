@@ -8,83 +8,71 @@ from skimage import color
 import torch
 import torch.utils.data
 from torchvision import datasets, models, transforms
+
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+
 save_list = [3,8,47,54,87,97,130,15,26,40,83,122,148,163]
 
 class Dataset(torch.utils.data.Dataset):
 
-    def __init__(self, args, img_paths, mask_paths,aug=False):
+    def __init__(self, args, img_paths, mask_paths,aug=False, preload=False):
         self.args = args
         self.img_paths = img_paths
         self.mask_paths = mask_paths
         self.aug = aug
+        self.preload = preload
         # self.index=select_index ##for test
+
+        if self.preload:
+            print("Preloading dataset into memory...")
+            self.images, self.labels = self._preload_data()
+            print("Preloading complete.")
+        else:
+            self.images, self.labels = None, None
+            
+    def _load_single_sample(self, paths):
+        img_path, mask_path = paths
+        npimage = np.load(img_path).astype("float32")
+        npmask = np.load(mask_path).astype("float32")
+        
+        npimage = npimage.astype("float32")
+        
+        WT_Label = (npmask == 1) | (npmask == 2) | (npmask == 4)
+        TC_Label = (npmask == 1) | (npmask == 4)
+        ET_Label = (npmask == 4)
+        nplabel = np.stack((WT_Label, TC_Label, ET_Label), axis=0).astype("float32")
+        return npimage, nplabel
+
+    def _preload_data(self):
+        """Preload all data into memory using multiprocessing with a progress bar."""
+        with Pool(cpu_count()*4) as pool:
+            # Wrap the pool map with tqdm for progress tracking
+            data = list(tqdm(pool.imap(self._load_single_sample, zip(self.img_paths, self.mask_paths)),
+                             total=len(self.img_paths), desc="Preloading data"))
+        images, labels = zip(*data)
+        return list(images), list(labels)
 
     def __len__(self):
         return len(self.img_paths)##1 for test
 
     def __getitem__(self, idx):
-        # idx=self.index  ##test mode
-        img_path = self.img_paths[idx]
-        mask_path = self.mask_paths[idx]
-        #读numpy数据(npy)的代码
-        # print("show name:",img_path)
-        npimage = np.load(img_path)
-        if idx in save_list:
-            # print("idx:",idx,npimage.shape)
-            cv2.imwrite("./saved_testinput_origin/flair_" + str(idx) + ".png", 255*npimage[:,:,0])
-            cv2.imwrite("./saved_testinput_origin/t1_" + str(idx) + ".png", 255*npimage[:,:,1])
-            cv2.imwrite("./saved_testinput_origin/t1ce_" + str(idx) + ".png", 255*npimage[:,:,2])
-            cv2.imwrite("./saved_testinput_origin/t2_" + str(idx) + ".png", 255*npimage[:,:,3])
-        #print("load image:",np.max(npimage))
-        npmask = np.load(mask_path)
-        # print("shape::::",npimage.shape)
+        # Load preloaded data or from disk
+        if self.preload:
+            npimage = self.images[idx]
+            nplabel = self.labels[idx]
+        else:
+            npimage = np.load(self.img_paths[idx]).astype("float32")
+            npmask = np.load(self.mask_paths[idx]).astype("float32")
+
+            npimage = npimage.astype("float32")
+
+            WT_Label = (npmask == 1) | (npmask == 2) | (npmask == 4)
+            TC_Label = (npmask == 1) | (npmask == 4)
+            ET_Label = (npmask == 4)
+            nplabel = np.stack((WT_Label, TC_Label, ET_Label), axis=0).astype("float32")
+            
         npimage = npimage.transpose((2, 0, 1))
-
-        WT_Label = npmask.copy()
-        WT_Label[npmask == 1] = 1.
-        WT_Label[npmask == 2] = 1.
-        WT_Label[npmask == 4] = 1.
-        TC_Label = npmask.copy()
-        TC_Label[npmask == 1] = 1.
-        TC_Label[npmask == 2] = 0.
-        TC_Label[npmask == 4] = 1.
-        ET_Label = npmask.copy()
-        ET_Label[npmask == 1] = 0.
-        ET_Label[npmask == 2] = 0.
-        ET_Label[npmask == 4] = 1.
-        nplabel = np.empty((160, 160, 3))
-        nplabel[:, :, 0] = WT_Label
-        nplabel[:, :, 1] = TC_Label
-        nplabel[:, :, 2] = ET_Label
-        nplabel = nplabel.transpose((2, 0, 1))
-
-        nplabel = nplabel.astype("float32")
-        npimage = npimage.astype("float32")
-
-        return npimage,nplabel
-
-
-        #读图片（如jpg、png）的代码
-        '''
-        image = imread(img_path)
-        mask = imread(mask_path)
-
-        image = image.astype('float32') / 255
-        mask = mask.astype('float32') / 255
-
-        if self.aug:
-            if random.uniform(0, 1) > 0.5:
-                image = image[:, ::-1, :].copy()
-                mask = mask[:, ::-1].copy()
-            if random.uniform(0, 1) > 0.5:
-                image = image[::-1, :, :].copy()
-                mask = mask[::-1, :].copy()
-
-        image = color.gray2rgb(image)
-        #image = image[:,:,np.newaxis]
-        image = image.transpose((2, 0, 1))
-        mask = mask[:,:,np.newaxis]
-        mask = mask.transpose((2, 0, 1))       
-        return image, mask
-        '''
+            
+        return npimage, nplabel
 
