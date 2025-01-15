@@ -27,6 +27,10 @@ from torch.nn import SyncBatchNorm
 from config import get_config
 import torch.distributed as dist
 
+COMPILE = True
+USE_AMP = True
+DISTRIBUTED = False
+
 loss_names = []
 loss_names.append('BCEWithLogitsLoss')
 
@@ -87,7 +91,7 @@ def parse_args():
 
     return args
 
-def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None):
+def train(args, train_loader, model, criterion, optimizer, epoch, scaler=None, scheduler=None):
     losses = AverageMeter()
     ious = AverageMeter()
     device = torch.device("cuda", args.local_rank)
@@ -97,20 +101,27 @@ def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None
         input = input.to(device)
         target = target.to(device)
         
-        output = model(input)
-        if args.name == "dual":
-            b,c,h,w = input.shape
-            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-        loss = criterion(output, target)
+        with torch.cuda.amp.autocast(enabled=USE_AMP):
+            output = model(input)
+            loss = criterion(output, target)
+
         iou = iou_score(output, target)
 
         losses.update(loss.item(), input.size(0))
         ious.update(iou, input.size(0))
 
-        # compute gradient and do optimizing step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        
+        if USE_AMP:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)  # Unscale gradients before clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+            scaler.step(optimizer)
+            scaler.update()
+            
+        else:
+            loss.backward()
+            optimizer.step()
 
     log = OrderedDict([
         ('loss', losses.avg),
@@ -137,12 +148,12 @@ def rgb_out(output):
                 rgbPic[idx, idy, 2] = 0
     return rgbPic
 
-def validate(args, val_loader, model, criterion,save_output=False):
+def validate(args, val_loader, model, criterion, save_output=False):
     device = torch.device("cuda", args.local_rank)
     losses = AverageMeter()
     ious = AverageMeter()
     if save_output==True:
-        save_path = os.path.join("./datasets/BraTs2019/rgb_results/",args.name)
+        save_path = os.path.join("./datasets/BraTs2019/rgb_results/", args.name)
         os.makedirs(save_path,exist_ok=True)
         img_path = os.path.join("./datasets/BraTs2019/rgb_results/", "img")
         os.makedirs(img_path, exist_ok=True)
@@ -152,16 +163,15 @@ def validate(args, val_loader, model, criterion,save_output=False):
         for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
             input = input.to(device)
             target = target.to(device)
-
-            output = model(input)
-            if args.name == "dual":
-                b, c, h, w = input.shape
-                output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-            if save_output==True:
-                gt_path = os.path.join(save_path, str(i) + "gt.png")
-                gt = rgb_out(target.squeeze())
-                imsave(gt_path, gt)
-            loss = criterion(output, target)
+            
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    output = model(input)
+                    if save_output==True:
+                        gt_path = os.path.join(save_path, str(i) + "gt.png")
+                        gt = rgb_out(target.squeeze())
+                        imsave(gt_path, gt)
+                    loss = criterion(output, target)
             iou = iou_score(output, target)
 
             losses.update(loss.item(), input.size(0))
@@ -208,75 +218,57 @@ def main():
         train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
     print("train_num:%s"%str(len(train_img_paths)))
     print("val_num:%s"%str(len(val_img_paths)))
-    # create model
+
     print("=> creating model %s" %args.name)
     if args.name=="vgunet":
         model = VGUNet(in_ch=4,out_ch=3)
-    if args.name == "unet++":
-        model = UNet_2Plus(in_channels=4,n_classes=3)
-    if args.name == "deeplabv3":
-        model = DeepLabV3(class_num=3)
-    if args.name == "attunet":
-        model = AttU_Net(img_ch=4, output_ch=3)
-    if args.name == "swinunet":
-        config = get_config(args)
-        model = ViT_seg(config,  num_classes=3)
-    if args.name=="dual":
-        from baseline_model.DualGCN import DualSeg_res50
-        import torch.nn.functional as F
-        model = DualSeg_res50(num_classes=3)
-    if args.name == "swin2":
-        from baseline_model.swinunet2 import swin_transformer_v2_g,swin_transformer_v2_l
-        from baseline_model.swinwrapper import ClassificationModelWrapper
-        model = ClassificationModelWrapper(swin_transformer_v2_l(in_channels=4,input_resolution=(160, 160),\
-                window_size=5),number_of_classes=3,output_channels=1536)
+    else:
+        print("Removed all other models")
+        exit(1)
 
     get_param_num(model)
     model = model.to(device)
 
-    target_layers = [model.bottleneck]
-
-    for target_layer in target_layers:
-        total_params = 0
-        for name, param in target_layer.named_parameters():
-            if param.requires_grad:
-                total_params += param.numel()
-
-        print("参数数量:",str(target_layer), total_params)
-    print("summary:",)
     if args.pretrain==True:
         print("usig pretrained model!!!")
         pretrain_pth = './models/unet/'+"unet_plain91.08.pth"#str(args.name)+'/'+str(args.name)+'_max_pool.pth'
         pretrain_pth = './models/'+str(args.name)+'/'+str(args.name)+'_parallel_pretrained.pth'
         pretrained_model_dict = torch.load(pretrain_pth)
         model_dict = model.state_dict()
-        # for k, v in pretrained_model_dict.items():
-        #     print("key:", k, v)
+        
         pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}  # filter out unnecessary keys
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)
     print(count_params(model))
 
     if args.optimizer == 'Adam':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, eps=1e-4 if USE_AMP else 1e-8)
     elif args.optimizer == 'SGD':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr,
             momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.95, patience=3, verbose=True,min_lr=0.0000001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.95, patience=3, verbose=True, min_lr=1e-7)
 
     train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
     val_dataset = Dataset(args, val_img_paths, val_mask_paths)
-
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(args.local_rank)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,shuffle=False,pin_memory=True,drop_last=False)
-    model = SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
-    print("start parallel!!")
-
+    
+    if DISTRIBUTED:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(args.local_rank)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,shuffle=False,pin_memory=True,drop_last=False)
+        model = SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+        print("start parallel!!")
+    
+    else:
+        train_loader = torch.utils.data.DataLoader(train_dataset,num_workers=4,batch_size=args.batch_size,shuffle=True,pin_memory=True,drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset,num_workers=4,batch_size=args.batch_size,shuffle=False,pin_memory=True,drop_last=False)
+    
+    if COMPILE:
+        model = torch.compile(model)
+    
     log = pd.DataFrame(index=[], columns=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
     best_iou = 0
@@ -285,7 +277,8 @@ def main():
         print('Epoch [%d/%d]' %(epoch, args.epochs))
 
         # train for one epoch
-        train_log = train(args, train_loader, model, criterion, optimizer, epoch)
+        scaler = None if not USE_AMP else torch.cuda.amp.GradScaler()
+        train_log = train(args, train_loader, model, criterion, optimizer, epoch, scaler=scaler)
         scheduler.step(train_log['iou'])
         # evaluate on validation set
         val_log = validate(args, val_loader, model, criterion)
@@ -307,7 +300,7 @@ def main():
 
         trigger += 1
 
-        if val_log['iou'] > best_iou and torch.distributed.get_rank() == 0:####specify the first node to save the model
+        if val_log['iou'] > best_iou and torch.distributed.get_rank() == 0: # specify the first node to save the model
             save_pth = 'models/'+str(args.name)+'/'+str(args.name)+"_"+str(args.appdix)+'.pth'
             os.makedirs('models/'+str(args.name)+'/',exist_ok=True)
             torch.save(model.state_dict(), save_pth)
@@ -323,6 +316,7 @@ def main():
 
         torch.cuda.empty_cache()
     return 0
+
 def test():
     args = parse_args()
     device = torch.device("cuda", args.local_rank)
@@ -384,6 +378,8 @@ def test():
         %(test_log['loss'], test_log['iou']))
 
     torch.cuda.empty_cache()
+    
+    
 if __name__ == '__main__':
     args = parse_args()
     if args.action=="train":

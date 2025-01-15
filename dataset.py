@@ -17,27 +17,21 @@ class Dataset(torch.utils.data.Dataset):
         self.img_paths = img_paths
         self.mask_paths = mask_paths
         self.aug = aug
-        # self.index=select_index ##for test
 
     def __len__(self):
-        return len(self.img_paths)##1 for test
+        return len(self.img_paths)
 
     def __getitem__(self, idx):
-        # idx=self.index  ##test mode
         img_path = self.img_paths[idx]
         mask_path = self.mask_paths[idx]
-        #读numpy数据(npy)的代码
-        # print("show name:",img_path)
+
         npimage = np.load(img_path)
         if idx in save_list:
-            # print("idx:",idx,npimage.shape)
             cv2.imwrite("./saved_testinput_origin/flair_" + str(idx) + ".png", 255*npimage[:,:,0])
             cv2.imwrite("./saved_testinput_origin/t1_" + str(idx) + ".png", 255*npimage[:,:,1])
             cv2.imwrite("./saved_testinput_origin/t1ce_" + str(idx) + ".png", 255*npimage[:,:,2])
             cv2.imwrite("./saved_testinput_origin/t2_" + str(idx) + ".png", 255*npimage[:,:,3])
-        #print("load image:",np.max(npimage))
         npmask = np.load(mask_path)
-        # print("shape::::",npimage.shape)
         npimage = npimage.transpose((2, 0, 1))
 
         WT_Label = npmask.copy()
@@ -62,29 +56,4 @@ class Dataset(torch.utils.data.Dataset):
         npimage = npimage.astype("float32")
 
         return npimage,nplabel
-
-
-        #读图片（如jpg、png）的代码
-        '''
-        image = imread(img_path)
-        mask = imread(mask_path)
-
-        image = image.astype('float32') / 255
-        mask = mask.astype('float32') / 255
-
-        if self.aug:
-            if random.uniform(0, 1) > 0.5:
-                image = image[:, ::-1, :].copy()
-                mask = mask[:, ::-1].copy()
-            if random.uniform(0, 1) > 0.5:
-                image = image[::-1, :, :].copy()
-                mask = mask[::-1, :].copy()
-
-        image = color.gray2rgb(image)
-        #image = image[:,:,np.newaxis]
-        image = image.transpose((2, 0, 1))
-        mask = mask[:,:,np.newaxis]
-        mask = mask.transpose((2, 0, 1))       
-        return image, mask
-        '''
 

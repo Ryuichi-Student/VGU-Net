@@ -4,6 +4,24 @@ import torch
 import torch.nn.functional as F
 
 
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
 def mean_iou(y_true_in, y_pred_in, print_table=False):
     if True: #not np.sum(y_true_in.flatten()) == 0:
         labels = y_true_in
