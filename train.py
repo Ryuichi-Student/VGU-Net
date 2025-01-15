@@ -280,7 +280,6 @@ def main():
         scaler = None if not USE_AMP else torch.cuda.amp.GradScaler()
         train_log = train(args, train_loader, model, criterion, optimizer, epoch, scaler=scaler)
         scheduler.step(train_log['iou'])
-        # evaluate on validation set
         val_log = validate(args, val_loader, model, criterion)
 
         print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f'
@@ -295,7 +294,7 @@ def main():
             val_log['iou'],
         ], index=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
-        log = log.append(tmp, ignore_index=True)
+        log = pd.concat([log, tmp])
         log.to_csv('models/%s/log.csv' %args.name, index=False)
 
         trigger += 1
