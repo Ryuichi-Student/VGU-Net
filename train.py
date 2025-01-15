@@ -5,11 +5,9 @@ from collections import OrderedDict
 from tqdm import tqdm
 from PIL import Image
 from sklearn.model_selection import train_test_split
-# from sklearn.externals import joblib
+
 from skimage.io import imread
 from baseline_model.unet2plus import UNet_2Plus
-# from baseline_model.modeling.deeplab import *
-# from baseline_model.UNet3Plus import *
 from baseline_model.deeplabv3 import DeepLabV3
 from baseline_model.attention_unet import AttU_Net
 import torch.optim as optim
@@ -18,7 +16,7 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from VGUNet import *
 from dataset import Dataset
-from metrics import dice_coef, batch_iou, mean_iou, iou_score
+from metrics import dice_coef, batch_iou, mean_iou, iou_score, AverageMeter
 import losses
 from utils.utils import str2bool, count_params
 import pandas as pd
@@ -28,13 +26,16 @@ import os
 from torch.nn import SyncBatchNorm
 from config import get_config
 import torch.distributed as dist
-loss_names.append('BCEWithLogitsLoss')
 
+loss_names = []
+loss_names.append('BCEWithLogitsLoss')
 
 def get_param_num(net):
     total = sum(p.numel() for p in net.parameters())
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print('total params: %d,  trainable params: %d' % (total, trainable))
+    
+    
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", type=str, default=test,help="train or test")
@@ -86,23 +87,6 @@ def parse_args():
 
     return args
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
 def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None):
     losses = AverageMeter()
     ious = AverageMeter()
@@ -112,25 +96,13 @@ def train(args, train_loader, model, criterion, optimizer, epoch, scheduler=None
     for i, (input, target) in tqdm(enumerate(train_loader), total=len(train_loader)):
         input = input.to(device)
         target = target.to(device)
-
-        # compute output
-        if args.deepsupervision:
-            outputs = model(input)
-            if args.name == "dual":
-                b, c, h, w = input.shape
-                output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
-            iou = iou_score(outputs[-1], target)
-        else:
-            output = model(input)
-            if args.name == "dual":
-                b,c,h,w = input.shape
-                output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-            loss = criterion(output, target)
-            iou = iou_score(output, target)
+        
+        output = model(input)
+        if args.name == "dual":
+            b,c,h,w = input.shape
+            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
+        loss = criterion(output, target)
+        iou = iou_score(output, target)
 
         losses.update(loss.item(), input.size(0))
         ious.update(iou, input.size(0))
@@ -174,39 +146,23 @@ def validate(args, val_loader, model, criterion,save_output=False):
         os.makedirs(save_path,exist_ok=True)
         img_path = os.path.join("./datasets/BraTs2019/rgb_results/", "img")
         os.makedirs(img_path, exist_ok=True)
-    # switch to evaluate mode
+
     model.eval()
     with torch.no_grad():
         for i, (input, target) in tqdm(enumerate(val_loader), total=len(val_loader)):
             input = input.to(device)
             target = target.to(device)
 
-            # compute output
-            if args.deepsupervision:
-                outputs = model(input)
-                if args.name == "dual":
-                    b, c, h, w = input.shape
-                    output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                loss = 0
-                for output in outputs:
-                    loss += criterion(output, target)
-                loss /= len(outputs)
-                iou = iou_score(outputs[-1], target)
-            else:
-                output = model(input)
-                if args.name == "dual":
-                    b, c, h, w = input.shape
-                    output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                if save_output==True:
-                    # img = rgb_out(output.squeeze())
-                    # path = os.path.join(save_path,str(i)+".png")
-                    # imsave(path,img)
-                    gt_path = os.path.join(save_path, str(i) + "gt.png")
-                    gt = rgb_out(target.squeeze())
-                    imsave(gt_path, gt)
-                loss = criterion(output, target)
-                iou = iou_score(output, target)
-                # print("save path:", iou)
+            output = model(input)
+            if args.name == "dual":
+                b, c, h, w = input.shape
+                output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
+            if save_output==True:
+                gt_path = os.path.join(save_path, str(i) + "gt.png")
+                gt = rgb_out(target.squeeze())
+                imsave(gt_path, gt)
+            loss = criterion(output, target)
+            iou = iou_score(output, target)
 
             losses.update(loss.item(), input.size(0))
             ious.update(iou, input.size(0))
@@ -220,14 +176,10 @@ def validate(args, val_loader, model, criterion,save_output=False):
 
 def main():
     args = parse_args()
-    #args.dataset = "datasets"
 
-    device = torch.device("cuda", args.local_rank) ########!!!!!!!!!!!
+    device = torch.device("cuda", args.local_rank)
     if args.name is None:
-        if args.deepsupervision:
-            args.name = '%s_%s_wDS' %(args.dataset, args.name)
-        else:
-            args.name = '%s_%s_woDS' %(args.dataset, args.name)
+        args.name = '%s_%s_woDS' %(args.dataset, args.name)
     if not os.path.exists('models/%s' %args.name):
         os.makedirs('models/%s' %args.name,exist_ok=True)
 
@@ -281,12 +233,8 @@ def main():
 
     get_param_num(model)
     model = model.to(device)
-    # from torchsummary import summary
-    # summary(model, input_size=(4, 160, 160))
-    # 选择特定层
-    target_layers = [model.bottleneck]#,model.sgcn2,model.sgcn3]
 
-    # 统计参数数量
+    target_layers = [model.bottleneck]
 
     for target_layer in target_layers:
         total_params = 0
@@ -319,9 +267,6 @@ def main():
     train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
     val_dataset = Dataset(args, val_img_paths, val_mask_paths)
 
-    # train_loader = torch.utils.data.DataLoader(train_dataset,batch_size=args.batch_size,shuffle=True,pin_memory=True,drop_last=True)
-    # val_loader = torch.utils.data.DataLoader(val_dataset,batch_size=args.batch_size,shuffle=False,pin_memory=True,drop_last=False)
-    ##parallel
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(args.local_rank)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -380,14 +325,10 @@ def main():
     return 0
 def test():
     args = parse_args()
-    #args.dataset = "datasets"
     device = torch.device("cuda", args.local_rank)
 
     if args.name is None:
-        if args.deepsupervision:
-            args.name = '%s_%s_wDS' %(args.dataset, args.name)
-        else:
-            args.name = '%s_%s_woDS' %(args.dataset, args.name)
+        args.name = '%s_%s_woDS' %(args.dataset, args.name)
     if not os.path.exists('models/%s' %args.name):
         os.makedirs('models/%s' %args.name)
 
@@ -427,18 +368,6 @@ def test():
         config = get_config(args)
         model = ViT_seg(config,  num_classes=3)
     model = model.to(device)
-    # pretrain_pth = "msugnet_pretrain_unet_softmax+norm_noclip_nofix.pth"#args.name+"_normal.pth"#"./models/"+args.name+"/" + args.name+"_normal.pth"##"msugnet_pretrain_on_unet89.58.pth"  # str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-    # pretrained_model_dict = torch.load(pretrain_pth)
-    # model.load_state_dict(pretrained_model_dict)
-    # if args.pretrain==True:
-    #     pretrain_pth = './models/msugnet/'+"msugnet_pretrain_on_unet_fixencoder.pth"#str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-    #     pretrained_model_dict = torch.load(pretrain_pth)
-    #     model_dict = model.state_dict()
-    #     # for k, v in pretrained_model_dict.items():
-    #     #     print("key:", k, v)
-    #     pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}  # filter out unnecessary keys
-    #     model_dict.update(pretrained_dict)
-    #     model.load_state_dict(model_dict)
     print(count_params(model))
 
     test_dataset = Dataset(args, img_paths, mask_paths)

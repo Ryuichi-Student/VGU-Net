@@ -89,14 +89,9 @@ def main():
 
     print("testing moe:",args.mode)
     if args.mode == "GetPicture":
-        """
-        获取并保存模型生成的标签图
-        """
         model = model.cuda()
         model = nn.DataParallel(model)##parallel train need parallel test
         pretrain_pth = ("./models/" + args.name + "/" + args.name + "_23.10.11_unet_skiponbottleneck.pth")# swinunet
-        #"_oldconfig_4and7_23.1.15_parallel_pretrained.pth")#"_parallel_pretrained.pth"  # msugnet_pretrain_unet_softmax+norm_noclip_nofix_test75.99.pth"#
-        # "./models/" + args.name + "/" + args.name + "_plain91.08.pth"  # "msugnet_pretrain_unet_softmax+norm_noclip_nofix.pth"#args.name+"_normal.pth"#"msugnet_pretrain_on_unet89.58.pth"  # str(args.name)+'/'+str(args.name)+'_max_pool.pth'
         pretrained_model_dict = torch.load(pretrain_pth,map_location="cuda:0")
         model.load_state_dict(pretrained_model_dict)
         model.eval()
@@ -127,10 +122,8 @@ def main():
                         if args.name == "dual":
                             b, c, h, w = input.shape
                             output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                    #print("img_paths[i]:%s" % img_paths[i])
                     output = torch.sigmoid(output).data.cpu().numpy()
                     img_paths = val_img_paths[args.batch_size*i:args.batch_size*(i+1)]
-                    #print("output_shape:%s"%str(output.shape))
                     for i in range(output.shape[0]):
                         if plt_test == False:
                             npName = os.path.basename(img_paths[i])
@@ -164,9 +157,7 @@ def main():
                         imsave('datasets/BraTs2019/rgb_results/%s/'%args.name + str(index)+".png",rgbPic)
 
             torch.cuda.empty_cache()
-        """
-        将验证集中的GT numpy格式转换成图片格式并保存
-        """
+            
         save_gt = False
         if save_gt==True:
             print("Saving GT,numpy to picture")
@@ -190,52 +181,24 @@ def main():
                 GtColor = np.zeros([npmask.shape[0],npmask.shape[1],3], dtype=np.uint8)
                 for idx in range(npmask.shape[0]):
                     for idy in range(npmask.shape[1]):
-                        #坏疽(NET,non-enhancing tumor)(标签1) 红色
+                        # NET, non-enhancing tumor
                         if npmask[idx, idy] == 1:
                             GtColor[idx, idy, 0] = 255
                             GtColor[idx, idy, 1] = 0
                             GtColor[idx, idy, 2] = 0
-                        #浮肿区域(ED,peritumoral edema) (标签2) 绿色
+                        # ED, peritumoral edema
                         elif npmask[idx, idy] == 2:
                             GtColor[idx, idy, 0] = 0
                             GtColor[idx, idy, 1] = 128
                             GtColor[idx, idy, 2] = 0
-                        #增强肿瘤区域(ET,enhancing tumor)(标签4) 黄色
+                        # ET, enhancing tumor
                         elif npmask[idx, idy] == 4:
                             GtColor[idx, idy, 0] = 255
                             GtColor[idx, idy, 1] = 255
                             GtColor[idx, idy, 2] = 0
 
-                #imsave(val_gt_path + rgbName, GtColor)
                 imageio.imwrite(val_gt_path + "gt_"+rgbName, GtColor)
-            """
-            mask_path = val_mask_paths[idx]
-            name = os.path.basename(mask_path)
-            overNum = name.find(".npy")
-            name = name[0:overNum]
-            wtName = name + "_WT" + ".png"
-            tcName = name + "_TC" + ".png"
-            etName = name + "_ET" + ".png"
-
-            npmask = np.load(mask_path)
-
-            WT_Label = npmask.copy()
-            WT_Label[npmask == 1] = 1.
-            WT_Label[npmask == 2] = 1.
-            WT_Label[npmask == 4] = 1.
-            TC_Label = npmask.copy()
-            TC_Label[npmask == 1] = 1.
-            TC_Label[npmask == 2] = 0.
-            TC_Label[npmask == 4] = 1.
-            ET_Label = npmask.copy()
-            ET_Label[npmask == 1] = 0.
-            ET_Label[npmask == 2] = 0.
-            ET_Label[npmask == 4] = 1.
-
-            imsave(val_gt_path + wtName, (WT_Label * 255).astype('uint8'))
-            imsave(val_gt_path + tcName, (TC_Label * 255).astype('uint8'))
-            imsave(val_gt_path + etName, (ET_Label * 255).astype('uint8'))
-            """
+            
         print("Done!")
 
     if args.mode == "Calculate":
@@ -272,8 +235,7 @@ def main():
                       "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/swinunet_ET78.17_23.10.11",
                       "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/msugnet_best"]
         pbPath = glob("./datasets/BraTs2019/rgb_results/%s/" % args.name + "*.png")
-        # "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/deeplabv3",
-        # "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/dual",
+        
         saved_list = ["/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/unet"]
         for model_path in saved_list:
             wt_dices = []
