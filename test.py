@@ -24,6 +24,8 @@ from baseline_model.vision_transformer import SwinUnet as ViT_seg
 from config import get_config
 from train import DISTRIBUTED, USE_AMP, COMPILE
 
+SAVE_GT = False
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -174,8 +176,8 @@ def main():
 
             torch.cuda.empty_cache()
             
-        save_gt = True
-        if save_gt==True:
+        
+        if SAVE_GT:
             save_ground_truth(args, val_mask_paths)
             
         print("Done!")
