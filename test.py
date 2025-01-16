@@ -22,6 +22,7 @@ from VGUNet import *
 from dataset import Dataset
 from baseline_model.vision_transformer import SwinUnet as ViT_seg
 from config import get_config
+from train import DISTRIBUTED, USE_AMP, COMPILE
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -51,8 +52,76 @@ def parse_args():
     return args
 
 
+def create_rgb_image(data, shape, label_mapping):
+    """
+    Create an RGB image based on given data and label mapping.
+
+    Args:
+        data (numpy.ndarray): The input data, typically a mask or model output.
+        shape (tuple): The desired output image shape (height, width, channels).
+        label_mapping (dict): A dictionary mapping conditions to RGB colors.
+
+    Returns:
+        numpy.ndarray: The generated RGB image.
+    """
+
+    rgb_image = np.zeros(shape, dtype=np.uint8)
+    for label, color in label_mapping.items():
+        mask = label(data)  # Apply label-specific mask
+
+        rgb_image[mask] = color
+    return rgb_image
+
+
+def process_output(output, img_paths, index, args, plt_test=False):
+    """
+    Process and save model output as RGB images.
+
+    Args:
+        output (numpy.ndarray): The model's output.
+        img_paths (list): List of image file paths corresponding to the batch.
+        index (int): Batch index for naming files.
+        args: Additional arguments, including `args.name`.
+    """
+    os.makedirs(f'datasets/BraTs2019/rgb_results/{args.name}/', exist_ok=True)
+
+    for i, img_path in enumerate(img_paths):  # Handle each path in the list
+        np_name = os.path.basename(img_path)
+        rgb_name = os.path.splitext(np_name)[0] + ".png"
+
+        label_mapping = {
+            lambda data: data[0] > 0.5: [0, 128, 0],   # Green
+            lambda data: data[1] > 0.5: [255, 0, 0],  # Red
+            lambda data: data[2] > 0.5: [255, 255, 0] # Yellow
+        }
+        rgb_pic = create_rgb_image(output[i], (output.shape[2], output.shape[3], 3), label_mapping)
+
+        output_path = f'datasets/BraTs2019/rgb_results/{args.name}/{index*args.batch_size+i}.png'
+        imageio.imwrite(output_path, rgb_pic)
+    
+
+def save_ground_truth(args, val_mask_paths, plt_test=False, select_index=None):
+    save_path = f'datasets/BraTs2019/rgb_results/{args.name}/'
+    os.makedirs(save_path, exist_ok=True)
+    mask_paths = [val_mask_paths[select_index]] if plt_test else val_mask_paths
+
+    label_mapping = {
+        lambda data: data == 1: [255, 0, 0],   # NET
+        lambda data: data == 2: [0, 128, 0],  # ED
+        lambda data: data == 4: [255, 255, 0] # ET
+    }
+
+    for i, mask_path in enumerate(tqdm(mask_paths, desc="Saving GT")):
+        name = os.path.basename(mask_path)
+        rgb_name = f"{i}gt.png"
+        npmask = np.load(mask_path)
+
+        gt_color = create_rgb_image(npmask, (npmask.shape[0], npmask.shape[1], 3), label_mapping)
+        imageio.imwrite(f'{save_path}/{rgb_name}', gt_color)
+        
+
 def main():
-    args =parse_args()# joblib.load('models/%s/args.pkl' %val_args.name)
+    args = parse_args()
 
     if not os.path.exists('output/%s' %args.name):
         os.makedirs('output/%s' %args.name)
@@ -65,20 +134,7 @@ def main():
     # create model
     print("=> creating model %s" % args.name)
     if args.name == "vgunet":
-        model = VGUNet(in_ch=4, out_ch=3)
-    if args.name == "unet++":
-        model = UNet_2Plus(in_channels=4, n_classes=3)
-    if args.name == "deeplabv3":
-        model = DeepLabV3(class_num=3)
-    if args.name == "attunet":
-        model = AttU_Net(img_ch=4, output_ch=3)
-    if args.name == "swinunet":
-        config = get_config(args)
-        model = ViT_seg(config,  num_classes=3).cuda()
-    if args.name=="dual":
-        from baseline_model.DualGCN import DualSeg_res50
-        import torch.nn.functional as F
-        model = DualSeg_res50(num_classes=3)
+        model = VGUNet.load(in_ch=4, out_ch=3)
     model = model.cuda()
 
     # Data loading code
@@ -87,13 +143,13 @@ def main():
     val_img_paths = img_paths
     val_mask_paths = mask_paths
 
-    print("testing moe:",args.mode)
+    print("testing mode:",args.mode)
     if args.mode == "GetPicture":
         model = model.cuda()
-        model = nn.DataParallel(model)##parallel train need parallel test
-        pretrain_pth = ("./models/" + args.name + "/" + args.name + "_23.10.11_unet_skiponbottleneck.pth")# swinunet
-        pretrained_model_dict = torch.load(pretrain_pth,map_location="cuda:0")
-        model.load_state_dict(pretrained_model_dict)
+        if DISTRIBUTED:
+            model = nn.DataParallel(model)
+        if COMPILE:
+            model = torch.compile(model)
         model.eval()
         test_dataset = Dataset(args, val_img_paths, val_mask_paths)
         plt_test = False
@@ -101,7 +157,8 @@ def main():
             select_index = 40  # ,54,26 long distance,40 two class
             test_dataset = Dataset(args, img_paths, mask_paths, select_index)
 
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True,drop_last=False)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True,drop_last=False)
+        
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
 
@@ -109,134 +166,29 @@ def main():
                 for i, (input, target) in tqdm(enumerate(test_loader), total=len(test_loader)):
                     index=i
                     input = input.cuda()
-                    #target = target.cuda()
-
-                    # compute output
-                    if args.deepsupervision:
-                        output = model(input)[-1]
-                        if args.name == "dual":
-                            b, c, h, w = input.shape
-                            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                    else:
+                    with torch.cuda.amp.autocast():
                         output = model(input)
-                        if args.name == "dual":
-                            b, c, h, w = input.shape
-                            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
-                    output = torch.sigmoid(output).data.cpu().numpy()
+                        output = torch.sigmoid(output).data.cpu().numpy()
                     img_paths = val_img_paths[args.batch_size*i:args.batch_size*(i+1)]
-                    for i in range(output.shape[0]):
-                        if plt_test == False:
-                            npName = os.path.basename(img_paths[i])
-                            overNum = npName.find(".npy")
-                            rgbName = npName[0:overNum]
-                            rgbName = rgbName  + ".png"
-                        else:####single test
-                            idx = select_index
-                            img_path = val_img_paths[idx]
-                            name = os.path.basename(img_path)
-                            overNum = name.find(".npy")
-                            name = name[0:overNum]
-                            rgbName = name + ".png"
-
-                        rgbPic = np.zeros([160, 160, 3], dtype=np.uint8)
-                        for idx in range(output.shape[2]):
-                            for idy in range(output.shape[3]):
-                                if output[i,0,idx,idy] > 0.5: ##green
-                                    rgbPic[idx, idy, 0] = 0
-                                    rgbPic[idx, idy, 1] = 128
-                                    rgbPic[idx, idy, 2] = 0
-                                if output[i,1,idx,idy] > 0.5: ##red
-                                    rgbPic[idx, idy, 0] = 255
-                                    rgbPic[idx, idy, 1] = 0
-                                    rgbPic[idx, idy, 2] = 0
-                                if output[i,2,idx,idy] > 0.5: ##yellow
-                                    rgbPic[idx, idy, 0] = 255
-                                    rgbPic[idx, idy, 1] = 255
-                                    rgbPic[idx, idy, 2] = 0
-                        os.makedirs('datasets/BraTs2019/rgb_results/%s/'%args.name,exist_ok=True)
-                        imsave('datasets/BraTs2019/rgb_results/%s/'%args.name + str(index)+".png",rgbPic)
+                    process_output(output, img_paths, index, args)
 
             torch.cuda.empty_cache()
             
-        save_gt = False
+        save_gt = True
         if save_gt==True:
-            print("Saving GT,numpy to picture")
-            val_gt_path = 'output/%s/'%args.name + "GT/"
-            if not os.path.exists(val_gt_path):
-                os.mkdir(val_gt_path)
-            if plt_test == True:
-                length = 1
-            else:
-                length= len(val_mask_paths)
-            for idx in tqdm(range(length)):#)):
-                if plt_test==True:
-                    idx=select_index
-                mask_path = val_mask_paths[idx]
-                name = os.path.basename(mask_path)
-                overNum = name.find(".npy")
-                name = name[0:overNum]
-                rgbName = name + ".png"
-                npmask = np.load(mask_path)
-
-                GtColor = np.zeros([npmask.shape[0],npmask.shape[1],3], dtype=np.uint8)
-                for idx in range(npmask.shape[0]):
-                    for idy in range(npmask.shape[1]):
-                        # NET, non-enhancing tumor
-                        if npmask[idx, idy] == 1:
-                            GtColor[idx, idy, 0] = 255
-                            GtColor[idx, idy, 1] = 0
-                            GtColor[idx, idy, 2] = 0
-                        # ED, peritumoral edema
-                        elif npmask[idx, idy] == 2:
-                            GtColor[idx, idy, 0] = 0
-                            GtColor[idx, idy, 1] = 128
-                            GtColor[idx, idy, 2] = 0
-                        # ET, enhancing tumor
-                        elif npmask[idx, idy] == 4:
-                            GtColor[idx, idy, 0] = 255
-                            GtColor[idx, idy, 1] = 255
-                            GtColor[idx, idy, 2] = 0
-
-                imageio.imwrite(val_gt_path + "gt_"+rgbName, GtColor)
+            save_ground_truth(args, val_mask_paths)
             
         print("Done!")
 
     if args.mode == "Calculate":
         """
-        计算各种指标:Dice、Sensitivity、PPV
+        Dice, Sensitivity, PPV
         """
-        # wt_dices = []
-        # tc_dices = []
-        # et_dices = []
-        # wt_sensitivities = []
-        # tc_sensitivities = []
-        # et_sensitivities = []
-        # wt_ppvs = []
-        # tc_ppvs = []
-        # et_ppvs = []
-        # wt_Hausdorf = []
-        # tc_Hausdorf = []
-        # et_Hausdorf = []
-        #
-        # wtMaskList = []
-        # tcMaskList = []
-        # etMaskList = []
-        # wtPbList = []
-        # tcPbList = []
-        # etPbList = []
 
-        maskPath = glob("./datasets/BraTs2019/rgb_results/attunet/" + "*gt.png")  ###
-        saved_list = [
-
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/unet_ET0.70",
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/unet++",
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/attunet",
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/swinunet7686ET",
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/swinunet_ET78.17_23.10.11",
-                      "/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/msugnet_best"]
+        maskPath = glob("./datasets/BraTs2019/rgb_results/vgunet/" + "*gt.png")
         pbPath = glob("./datasets/BraTs2019/rgb_results/%s/" % args.name + "*.png")
         
-        saved_list = ["/home/jyh_temp1/Downloads/BRaTS2d_send/UNet2D_BraTs-master/datasets/BraTs2019/rgb_results/unet"]
+        saved_list = ["./datasets/BraTs2019/rgb_results/vgunet"]
         for model_path in saved_list:
             wt_dices = []
             tc_dices = []
@@ -257,39 +209,19 @@ def main():
                 print("请先生成图片!")
                 return
             for myi in tqdm(range(len(maskPath))):
-                # mask = imread(maskPath[myi])
-                # pb = imread(pbPath[myi])
-                ##single index
-                mask = imread("./datasets/BraTs2019/rgb_results/attunet/" + str(myi)+"gt.png")
+                mask = imread("./datasets/BraTs2019/rgb_results/vgunet/" + str(myi)+"gt.png")
                 pb = imread(model_path + "/" + str(myi) + ".png")
-                # pb = imread("./datasets/BraTs2019/rgb_results/"+str(args.name)+"/" + str(myi) + ".png")
-                wtmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-                wtpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
+                
+                wtmaskregion = (mask.sum(axis=-1) != 0).astype(np.float32)  # Any non-zero pixel
+                wtpbregion = (pb.sum(axis=-1) != 0).astype(np.float32)
 
-                tcmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-                tcpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
+                tcmaskregion = (mask[:, :, 0] == 255).astype(np.float32)  # Red channel
+                tcpbregion = (pb[:, :, 0] == 255).astype(np.float32)
 
-                etmaskregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
-                etpbregion = np.zeros([mask.shape[0], mask.shape[1]], dtype=np.float32)
+                etmaskregion = (mask[:, :, 1] == 128).astype(np.float32)  # Green channel
+                etpbregion = (pb[:, :, 1] == 128).astype(np.float32)
 
-                for idx in range(mask.shape[0]):
-                    for idy in range(mask.shape[1]):
-                        # 只要这个像素的任何一个通道有值,就代表这个像素不属于前景,即属于WT区域;yellow=255,255,0; red=255,0,0;green=0,128,0
-                        if mask[idx, idy, :].any() != 0:
-                            wtmaskregion[idx, idy] = 1
-                        if pb[idx, idy, :].any() != 0:
-                            wtpbregion[idx, idy] = 1
-                        # 只要第一个通道是255,即可判断是TC区域,因为红色和黄色的第一个通道都是255,区别于绿色
-                        if mask[idx, idy, 0] == 255:
-                            tcmaskregion[idx, idy] = 1
-                        if pb[idx, idy, 0] == 255:
-                            tcpbregion[idx, idy] = 1
-                        # 只要第二个通道是128,即可判断是ET区域
-                        if mask[idx, idy, 1] == 128:
-                            etmaskregion[idx, idy] = 1
-                        if pb[idx, idy, 1] == 128:
-                            etpbregion[idx, idy] = 1
-                #开始计算WT
+                #WT
                 dice = dice_coef(wtpbregion,wtmaskregion)
                 wt_dices.append(dice)
                 ppv_n = ppv(wtpbregion, wtmaskregion)
@@ -298,7 +230,7 @@ def main():
                 wt_Hausdorf.append(Hausdorff)
                 sensitivity_n = sensitivity(wtpbregion, wtmaskregion)
                 wt_sensitivities.append(sensitivity_n)
-                # 开始计算TC
+                # TC
                 dice = dice_coef(tcpbregion, tcmaskregion)
                 tc_dices.append(dice)
                 ppv_n = ppv(tcpbregion, tcmaskregion)
@@ -307,7 +239,7 @@ def main():
                 tc_Hausdorf.append(Hausdorff)
                 sensitivity_n = sensitivity(tcpbregion, tcmaskregion)
                 tc_sensitivities.append(sensitivity_n)
-                # 开始计算ET
+                # ET
                 dice = dice_coef(etpbregion, etmaskregion)
                 et_dices.append(dice)
                 ppv_n = ppv(etpbregion, etmaskregion)
