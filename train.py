@@ -299,7 +299,7 @@ def main():
 
         trigger += 1
 
-        if val_log['iou'] > best_iou and torch.distributed.get_rank() == 0: # specify the first node to save the model
+        if val_log['iou'] > best_iou and (not DISTRIBUTED or torch.distributed.get_rank() == 0): # specify the first node to save the model
             save_pth = 'models/'+str(args.name)+'/'+str(args.name)+"_"+str(args.appdix)+'.pth'
             os.makedirs('models/'+str(args.name)+'/',exist_ok=True)
             torch.save(model.state_dict(), save_pth)
