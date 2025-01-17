@@ -10,9 +10,8 @@ from vgu_modules.SpatialGCN import SpatialGCN, HydraGCN
 
 
 class VGUNet(nn.Module):
-    def __init__(self, in_ch=2, out_ch=2,base_nc=64,fix_grad=True):
+    def __init__(self, in_ch=2, out_ch=2, base_nc=64):
         super(VGUNet, self).__init__()
-        self.fix_grad = fix_grad
         self.conv1 = DoubleConv(in_ch, base_nc)
         self.pool1 = nn.Conv2d(base_nc, base_nc, 2, stride=2, padding=0, bias=False)  ##downsampling
         self.conv2 = DoubleConv(base_nc, 2 * base_nc)
@@ -20,9 +19,9 @@ class VGUNet(nn.Module):
         self.conv3 = DoubleConv(2 * base_nc, 4 * base_nc)
         self.pool3 = nn.Conv2d(4 * base_nc, 4 * base_nc, 2, stride=2, padding=0, bias=False)  ##downsampling
         
-        self.sgcn3 = SpatialGCN(2 * base_nc)
-        self.sgcn2 = SpatialGCN(4 * base_nc)
-        self.sgcn1 = SpatialGCN(4 * base_nc)  ###changed with spatialGCN
+        self.sgcn3 = HydraGCN(2 * base_nc)
+        self.sgcn2 = HydraGCN(4 * base_nc)
+        self.sgcn1 = HydraGCN(4 * base_nc)  ###changed with spatialGCN
         self.up6 = nn.ConvTranspose2d(4 * base_nc, 4 * base_nc, 2, stride=2,padding=0)  ##upsampling
         self.conv6 = DoubleConv(8 * base_nc, 4 * base_nc)
         self.up7 = nn.ConvTranspose2d(4 * base_nc, 2 * base_nc, 2, stride=2, padding=0)  ##upsampling
@@ -51,3 +50,17 @@ class VGUNet(nn.Module):
         c9= self.conv9(c8)
 
         return c9
+    
+    @staticmethod
+    def load(path='./models/vgunet/vgunet_normal.pth', in_ch=2, out_ch=2, base_nc=64):
+        print("usig pretrained model!!!")
+        pretrained_model_dict = torch.load(path)
+        # Remove torch.compiled model prefix
+        for key in list(pretrained_model_dict.keys()):
+            pretrained_model_dict[key.replace("_orig_mod.", "")] = pretrained_model_dict.pop(key)
+        model = VGUNet(in_ch, out_ch, base_nc)
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        return model
