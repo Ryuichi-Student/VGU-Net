@@ -65,13 +65,12 @@ class HydraGCN(nn.Module):
         self.node_v = nn.Conv2d(plane, self.inter_plane * num_heads, kernel_size=1)
         
         self.conv_wgl1 = nn.Linear(self.inter_plane * num_heads, out_plane)
-        self.conv_wgl2 = nn.Linear(inter_plane, out_plane)
+        self.conv_wgl2 = nn.Linear(out_plane, out_plane)
 
         self.bn1 = nn.BatchNorm1d(out_plane)
         self.bn2 = nn.BatchNorm1d(out_plane)
         
         self.softmax = nn.Softmax(dim=2)
-        self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -90,22 +89,26 @@ class HydraGCN(nn.Module):
 
         hydra_out = q * kv  # Element-wise query gating: (b, num_heads, N, inter_plane)
         hydra_out = hydra_out.transpose(1, 2).view(b, -1, self.num_heads * self.inter_plane) # (b, N, num_heads * inter_plane)
-        hydra_out = F.relu(self.bn1(self.conv_wgl1(hydra_out).transpose(1,2)).transpose(1,2))  # b, N, out
+        hydra_out = F.relu(self.bn1(self.conv_wgl1(hydra_out).transpose(1, 2)).transpose(1, 2))  # b, N, out
+        hydra_out = F.dropout(hydra_out)
+        
+        hydra_out = F.relu(self.bn2(self.conv_wgl2(hydra_out).transpose(1, 2)).transpose(1, 2))
+        return hydra_out.transpose(1, 2).contiguous().view(b, c, h, -1)
         
         # Compute mean of keys and queries across heads
-        k_mean = k.mean(dim=1)  # (b, N, inter_plane)
-        q_mean = q.mean(dim=1).permute(0, 2, 1)  # (b, inter_plane, N)
+#         k_mean = k.mean(dim=1)  # (b, N, inter_plane)
+#         q_mean = q.mean(dim=1).permute(0, 2, 1)  # (b, inter_plane, N)
         
-        Adj = torch.bmm(k_mean, q_mean)  # (b, N, N)
-        Adj = self.softmax(Adj)  # Normalize adjacency matrix
+#         Adj = torch.bmm(k_mean, q_mean)  # (b, N, N)
+#         Adj = self.softmax(Adj)  # Normalize adjacency matrix
         
-        # add one more layer
-        AV = torch.bmm(Adj, hydra_out)
-        AVW = F.relu(self.bn2(self.conv_wgl2(AV).transpose(1,2)).transpose(1,2))
-        AVW = F.dropout(AVW)
+#         # add one more layer
+#         AV = torch.bmm(Adj, hydra_out)
+#         AVW = F.relu(self.bn2(self.conv_wgl2(AV).transpose(1,2)).transpose(1,2))
+#         AVW = F.dropout(AVW)
 
-        # end
-        AVW = AVW.transpose(1, 2).contiguous()###AV withj shape NxC,N=mxn
-        b,c,n = AVW.shape
-        AVW = AVW.view(b, c, h, -1)
-        return AVW
+#         # end
+#         AVW = AVW.transpose(1, 2).contiguous()###AV withj shape NxC,N=mxn
+#         b,c,n = AVW.shape
+#         AVW = AVW.view(b, c, h, -1)
+#         return AVW
