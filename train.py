@@ -7,9 +7,6 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 
 from skimage.io import imread
-from baseline_model.unet2plus import UNet_2Plus
-from baseline_model.deeplabv3 import DeepLabV3
-from baseline_model.attention_unet import AttU_Net
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
@@ -20,7 +17,6 @@ from metrics import dice_coef, batch_iou, mean_iou, iou_score, AverageMeter
 import losses
 from utils.utils import str2bool, count_params
 import pandas as pd
-from baseline_model.vision_transformer import SwinUnet as ViT_seg
 from skimage.io import imread, imsave
 import os
 from torch.nn import SyncBatchNorm
@@ -221,25 +217,16 @@ def main():
 
     print("=> creating model %s" %args.name)
     if args.name=="vgunet":
-        model = VGUNet(in_ch=4,out_ch=3)
+        if args.pretrain:
+            model = VGUNet.load(in_ch=4,out_ch=3)
+        else:
+            model = VGUNet(in_ch=4,out_ch=3)
     else:
         print("Removed all other models")
         exit(1)
 
     get_param_num(model)
     model = model.to(device)
-
-    if args.pretrain==True:
-        print("usig pretrained model!!!")
-        pretrain_pth = './models/unet/'+"unet_plain91.08.pth"#str(args.name)+'/'+str(args.name)+'_max_pool.pth'
-        pretrain_pth = './models/'+str(args.name)+'/'+str(args.name)+'_parallel_pretrained.pth'
-        pretrained_model_dict = torch.load(pretrain_pth)
-        model_dict = model.state_dict()
-        
-        pretrained_dict = {k: v for k, v in pretrained_model_dict.items() if k in model_dict}  # filter out unnecessary keys
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-    print(count_params(model))
 
     if args.optimizer == 'Adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, eps=1e-4 if USE_AMP else 1e-8)
@@ -334,8 +321,6 @@ def test():
         for arg in vars(args):
             print('%s: %s' %(arg, getattr(args, arg)), file=f)
 
-    #joblib.dump(args, 'models/%s/args.pkl' %args.name)
-
     # define loss function (criterion)
     if args.loss == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss().to(device)
@@ -350,16 +335,7 @@ def test():
 
     # create model
     if args.name == "vgunet":
-        model = VGUNet(in_ch=4, out_ch=3)
-    if args.name == "unet++":
-        model = UNet_2Plus(in_channels=4, n_classes=3)
-    if args.name == "deeplabv3":
-        model = DeepLabV3(class_num=3)
-    if args.name == "attunet":
-        model = AttU_Net(img_ch=4, output_ch=3)
-    if args.name == "swinunet":
-        config = get_config(args)
-        model = ViT_seg(config,  num_classes=3)
+        model = VGUNet.load(in_ch=4, out_ch=3)
     model = model.to(device)
     print(count_params(model))
 

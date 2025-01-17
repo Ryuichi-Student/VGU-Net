@@ -7,13 +7,13 @@ class SpatialGCN(nn.Module):
     def __init__(self, plane,inter_plane=None,out_plane=None):
         super(SpatialGCN, self).__init__()
         if inter_plane==None:
-            inter_plane = plane #// 2
+            inter_plane = plane
         if out_plane==None:
             out_plane = plane
         self.node_k = nn.Conv2d(plane, inter_plane, kernel_size=1)
         self.node_q = nn.Conv2d(plane, inter_plane, kernel_size=1)
         self.node_v = nn.Conv2d(plane, inter_plane, kernel_size=1)
-        self.conv_wgl = nn.Linear(inter_plane,out_plane)
+        self.conv_wgl = nn.Linear(inter_plane, out_plane)
         self.bn1 = nn.BatchNorm1d(out_plane)
         self.conv_wgl2 = nn.Linear(out_plane, out_plane)
         self.bn2 = nn.BatchNorm1d(out_plane)
@@ -37,7 +37,7 @@ class SpatialGCN(nn.Module):
         AVW = F.dropout(AVW)
 
         # add one more layer
-        AV = torch.bmm(Adj,AVW)
+        AV = torch.bmm(Adj, AVW)
         AVW = F.relu(self.bn2(self.conv_wgl2(AV).transpose(1,2)).transpose(1,2))
         AVW = F.dropout(AVW)
 
@@ -63,18 +63,17 @@ class HydraGCN(nn.Module):
         self.node_k = nn.Conv2d(plane, self.inter_plane * num_heads, kernel_size=1)
         self.node_q = nn.Conv2d(plane, self.inter_plane * num_heads, kernel_size=1)
         self.node_v = nn.Conv2d(plane, self.inter_plane * num_heads, kernel_size=1)
+        
+        self.conv_wgl1 = nn.Linear(self.inter_plane * num_heads, out_plane)
+        self.conv_wgl2 = nn.Linear(inter_plane, out_plane)
 
-        self.final_projection = nn.Conv2d(self.inter_plane * num_heads, out_plane, kernel_size=1)
+        self.bn1 = nn.BatchNorm1d(out_plane)
+        self.bn2 = nn.BatchNorm1d(out_plane)
+        
+        self.softmax = nn.Softmax(dim=2)
+        self.dropout = nn.Dropout(p=0.5)
 
-        self.gcn_layer1 = nn.Conv2d(out_plane, out_plane, kernel_size=1)
-        self.gcn_layer2 = nn.Conv2d(out_plane, out_plane, kernel_size=1)
-
-        self.bn1 = nn.BatchNorm2d(out_plane)
-        self.bn2 = nn.BatchNorm2d(out_plane)
-
-        self.relu = nn.ReLU()
-
-    def hydra_attention(self, x):
+    def forward(self, x):
         b, c, h, w = x.size()
 
         # Compute keys, queries, and values for all heads   # (b, num_heads, N, inter_plane)
@@ -85,26 +84,28 @@ class HydraGCN(nn.Module):
         k = F.normalize(k, dim=-1)
         q = F.normalize(q, dim=-1)
 
-        # Global KV aggregation (avoids T x T matrix computation)
+        # Global KV aggregation
         kv = torch.einsum('bnhf,bnhf->bnf', k, v)
         kv = kv.unsqueeze(2)  # (b, num_heads, 1, inter_plane)
 
-        # Apply gating using queries
-        hydra_out = q * kv  # Element-wise gating: (b, num_heads, N, inter_plane)
+        hydra_out = q * kv  # Element-wise query gating: (b, num_heads, N, inter_plane)
+        hydra_out = hydra_out.transpose(1, 2).view(b, -1, self.num_heads * self.inter_plane) # (b, N, num_heads * inter_plane)
+        hydra_out = F.relu(self.bn1(self.conv_wgl1(hydra_out).transpose(1,2)).transpose(1,2))  # b, N, out
+        
+        # Compute mean of keys and queries across heads
+        k_mean = k.mean(dim=1)  # (b, N, inter_plane)
+        q_mean = q.mean(dim=1).permute(0, 2, 1)  # (b, inter_plane, N)
+        
+        Adj = torch.bmm(k_mean, q_mean)  # (b, N, N)
+        Adj = self.softmax(Adj)  # Normalize adjacency matrix
+        
+        # add one more layer
+        AV = torch.bmm(Adj, hydra_out)
+        AVW = F.relu(self.bn2(self.conv_wgl2(AV).transpose(1,2)).transpose(1,2))
+        AVW = F.dropout(AVW)
 
-        # Reshape and combine multi-head outputs  # (b, num_heads * inter_plane, h, w)
-        hydra_out = hydra_out.permute(0, 1, 3, 2).reshape(b, -1, h, w)
-
-        return self.final_projection(hydra_out)  # (b, out_plane, h, w)
-
-    def forward(self, x):
-        x = self.hydra_attention(x)
-
-        x = self.gcn_layer1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.gcn_layer2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        return x
+        # end
+        AVW = AVW.transpose(1, 2).contiguous()###AV withj shape NxC,N=mxn
+        b,c,n = AVW.shape
+        AVW = AVW.view(b, c, h, -1)
+        return AVW
