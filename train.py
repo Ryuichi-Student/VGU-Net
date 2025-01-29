@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from VGUNet import *
 from dataset import Dataset
-from metrics import dice_coef, batch_iou, mean_iou, iou_score, AverageMeter
+from metrics import dice_coef, batch_iou, mean_iou, iou_score, AverageMeter, pixel_accuracy
 import losses
 from utils.utils import str2bool, count_params
 import pandas as pd
@@ -23,7 +23,7 @@ from torch.nn import SyncBatchNorm
 from config import get_config
 import torch.distributed as dist
 
-COMPILE = True
+COMPILE = False
 USE_AMP = True
 DISTRIBUTED = False
 
@@ -34,7 +34,6 @@ def get_param_num(net):
     total = sum(p.numel() for p in net.parameters())
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print('total params: %d,  trainable params: %d' % (total, trainable))
-    
     
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -97,16 +96,18 @@ def train(args, train_loader, model, criterion, optimizer, epoch, scaler=None, s
         input = input.to(device)
         target = target.to(device)
         
+        optimizer.zero_grad()
+        
         with torch.cuda.amp.autocast(enabled=USE_AMP):
             output = model(input)
             loss = criterion(output, target)
 
         iou = iou_score(output, target)
+        
+        # acc = pixel_accuracy(output, target)
 
         losses.update(loss.item(), input.size(0))
         ious.update(iou, input.size(0))
-
-        optimizer.zero_grad()
         
         if USE_AMP:
             scaler.scale(loss).backward()
@@ -149,9 +150,9 @@ def validate(args, val_loader, model, criterion, save_output=False):
     losses = AverageMeter()
     ious = AverageMeter()
     if save_output==True:
-        save_path = os.path.join("./datasets/BraTs2019/rgb_results/", args.name)
+        save_path = os.path.join("./local_datasets/BraTs2019/rgb_results/", args.name)
         os.makedirs(save_path,exist_ok=True)
-        img_path = os.path.join("./datasets/BraTs2019/rgb_results/", "img")
+        img_path = os.path.join("./local_datasets/BraTs2019/rgb_results/", "img")
         os.makedirs(img_path, exist_ok=True)
 
     model.eval()
@@ -160,14 +161,13 @@ def validate(args, val_loader, model, criterion, save_output=False):
             input = input.to(device)
             target = target.to(device)
             
-            if USE_AMP:
-                with torch.cuda.amp.autocast():
-                    output = model(input)
-                    if save_output==True:
-                        gt_path = os.path.join(save_path, str(i) + "gt.png")
-                        gt = rgb_out(target.squeeze())
-                        imsave(gt_path, gt)
-                    loss = criterion(output, target)
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                output = model(input)
+                if save_output==True:
+                    gt_path = os.path.join(save_path, str(i) + "gt.png")
+                    gt = rgb_out(target.squeeze())
+                    imsave(gt_path, gt)
+                loss = criterion(output, target)
             iou = iou_score(output, target)
 
             losses.update(loss.item(), input.size(0))
@@ -187,7 +187,7 @@ def main():
     if args.name is None:
         args.name = '%s_%s_woDS' %(args.dataset, args.name)
     if not os.path.exists('models/%s' %args.name):
-        os.makedirs('models/%s' %args.name,exist_ok=True)
+        os.makedirs('models/%s' %args.name, exist_ok=True)
 
     print('Config -----')
     for arg in vars(args):
@@ -207,8 +207,8 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    img_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage/*')
-    mask_paths = glob(r'./datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask/*')
+    img_paths = glob(r'./local_datasets/2-MICCAI_BraTS_2018/BraTS2018_trainImage/*')
+    mask_paths = glob(r'./local_datasets/2-MICCAI_BraTS_2018/BraTS2018_trainMask/*')
 
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
         train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
@@ -227,13 +227,22 @@ def main():
 
     get_param_num(model)
     model = model.to(device)
-
+            
     if args.optimizer == 'Adam':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, eps=1e-4 if USE_AMP else 1e-8)
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()), 
+            lr=args.lr, 
+            weight_decay=1e-5,  # L2 regularisation
+            eps=1e-4 if USE_AMP else 1e-8
+        )
     elif args.optimizer == 'SGD':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr,
             momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.95, patience=3, verbose=True, min_lr=1e-7)
+    
+    if args.pretrain:
+        checkpoint = torch.load(f"models/{args.name}/optimizer.pth")
+        optimizer.load_state_dict(checkpoint)
 
     train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
     val_dataset = Dataset(args, val_img_paths, val_mask_paths)
@@ -244,7 +253,7 @@ def main():
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,shuffle=False,pin_memory=True,drop_last=False)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, pin_memory=True, drop_last=False)
         model = SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
         print("start parallel!!")
@@ -287,8 +296,8 @@ def main():
         trigger += 1
 
         if val_log['iou'] > best_iou and (not DISTRIBUTED or torch.distributed.get_rank() == 0): # specify the first node to save the model
-            save_pth = 'models/'+str(args.name)+'/'+str(args.name)+"_"+str(args.appdix)+'.pth'
-            os.makedirs('models/'+str(args.name)+'/',exist_ok=True)
+            save_pth = f'models/{args.name}/{args.name}_{args.appdix}.pth'
+            os.makedirs(f'models/{args.name}/', exist_ok=True)
             torch.save(model.state_dict(), save_pth)
             best_iou = val_log['iou']
             print("=> saved best model")
@@ -317,11 +326,10 @@ def test():
         print('%s: %s' %(arg, getattr(args, arg)))
     print('------------')
 
-    with open('models/%s/args.txt' %args.name, 'w') as f:
+    with open(f'models/{args.name}/args.txt', 'w') as f:
         for arg in vars(args):
             print('%s: %s' %(arg, getattr(args, arg)), file=f)
 
-    # define loss function (criterion)
     if args.loss == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss().to(device)
     else:
@@ -330,8 +338,8 @@ def test():
     cudnn.benchmark = True
 
     # Data loading code
-    img_paths = glob(r'./datasets/BraTs2019/testImage/*')
-    mask_paths = glob(r'./datasets/BraTs2019/testMask/*')
+    img_paths = glob(r'./local_datasets/BraTs2019/testImage/*')
+    mask_paths = glob(r'./local_datasets/BraTs2019/testMask/*')
 
     # create model
     if args.name == "vgunet":

@@ -143,14 +143,37 @@ def dice_coef(output, target):
     return (2. * intersection + smooth)/(output.sum() + target.sum() + smooth)
 
 
-def accuracy(output, target):
-    output = torch.sigmoid(output).view(-1).data.cpu().numpy()
-    output = (np.round(output)).astype('int')
-    target = target.view(-1).data.cpu().numpy()
-    target = (np.round(target)).astype('int')
-    (output == target).sum()
+def calculate_accuracy(outputs, targets):
+    # torch.max returns max, indices
+    _, predicted = torch.max(outputs, dim=1)
 
-    return (output == target).sum() / len(output)
+    correct = (predicted == targets).sum().item()
+    total = targets.size(0)
+    accuracy = correct / total
+
+    return accuracy
+
+def pixel_accuracy(logits, masks):
+    with torch.no_grad():
+        predicted_mask = torch.argmax(logits, dim=1)  # [batch_size, height, width]
+
+        true_mask = torch.argmax(masks, dim=1)  # [batch_size, height, width]
+
+        correct_pred = (predicted_mask == true_mask)  # [batch_size, height, width]
+
+        accuracy = torch.sum(correct_pred).item() / correct_pred.numel()
+
+    return accuracy
+
+
+# def accuracy(output, target):
+#     output = torch.sigmoid(output).view(-1).data.cpu().numpy()
+#     output = (np.round(output)).astype('int')
+#     target = target.view(-1).data.cpu().numpy()
+#     target = (np.round(target)).astype('int')
+#     (output == target).sum()
+
+#     return (output == target).sum() / len(output)
 
 def ppv(output, target):
     smooth = 1e-5

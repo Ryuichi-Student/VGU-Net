@@ -13,7 +13,7 @@ from collections.abc import Mapping
 
 
 class Backbone(nn.Module):
-    def __init__(self, in_ch=2, out_ch=2, base_nc=64, use_hypergraph=True, image_height=160 , **kwargs):
+    def __init__(self, in_ch=2, out_ch=2, base_nc=64, use_hypergraph=False, image_height=160 , **kwargs):
         super(Backbone, self).__init__()
         self.conv1 = DoubleConv(in_ch, base_nc)
         self.pool1 = nn.Conv2d(base_nc, base_nc, 2, stride=2, padding=0, bias=False)  ##downsampling
@@ -22,7 +22,8 @@ class Backbone(nn.Module):
         self.conv3 = DoubleConv(2 * base_nc, 4 * base_nc)
         self.pool3 = nn.Conv2d(4 * base_nc, 4 * base_nc, 2, stride=2, padding=0, bias=False)  ##downsampling
         
-        self.sgcn1 = HydraGCN(4 * base_nc)
+        # self.sgcn1 = HydraGCN(4 * base_nc, num_heads=out_ch)
+        self.sgcn1 = SpatialGCN(4 * base_nc)
         self.up6 = None if use_hypergraph else nn.ConvTranspose2d(4 * base_nc, 4 * base_nc, 2, stride=2,padding=0)  ##upsampling
         
         self.use_hypergraph = use_hypergraph
@@ -57,7 +58,8 @@ class Head(nn.Module):
 class SegmentationHead(Head):
     def __init__(self, base_nc=64, out_ch=2, **kwargs):
         super(SegmentationHead, self).__init__()
-        self.sgcn3 = SpatialGCN(2 * base_nc)
+        # Replace largest bottleneck sgcn3 with HydraGCN, which is less GPU RAM-intensive.
+        self.sgcn3 = HydraGCN(2 * base_nc, num_heads=out_ch)
         self.sgcn2 = SpatialGCN(4 * base_nc)
 
         self.conv6 = DoubleConv(8 * base_nc, 4 * base_nc)
@@ -85,20 +87,23 @@ class SegmentationHead(Head):
     
 class ClassificationHead(Head):
     def __init__(self, base_nc=64, num_classes=4, **kwargs):
-        super(SegmentationHead, self).__init__()
+        super(ClassificationHead, self).__init__()
         
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
             nn.Flatten(),
-            nn.Linear(8*base_nc, 4*base_nc),
-            nn.BatchNorm1d(4*base_nc),
+            nn.Linear(4*base_nc, 2*base_nc),
+            nn.BatchNorm1d(2*base_nc),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.5),
-            nn.Linear(4*base_nc, num_classes)
+            nn.Linear(2*base_nc, num_classes)
         )
         
     def forward(self, c1, c2, c3, up_6):
-        return self.classifier(up_6)
+        # up_6: B, base_nc*4, h, w
+        classification = self.classifier(up_6)
+        # classification: B, num_classes
+        return classification
     
     
 @dataclass

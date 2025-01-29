@@ -185,8 +185,8 @@ class HyperNet(nn.Module):
         self.hgnn1 = HGNN(in_ch, node=image_height*2)
         self.hgnn2 = HGNN(in_ch, node=image_height)
         
-        self.channels = [1024, 512]
-        self.decoder1 = Decoder(1024, 256)
+        self.channels = [in_ch*4, in_ch*2]
+        self.decoder1 = Decoder(in_ch*4, in_ch)
         
         
     def forward(self, x):

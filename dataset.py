@@ -51,9 +51,13 @@ class Dataset(torch.utils.data.Dataset):
         nplabel[:, :, 1] = TC_Label
         nplabel[:, :, 2] = ET_Label
         nplabel = nplabel.transpose((2, 0, 1))
+        
+#         with np.printoptions(threshold=np.inf):
+#             print(npimage[0])
+#         exit(0)
 
         nplabel = nplabel.astype("float32")
         npimage = npimage.astype("float32")
 
-        return npimage,nplabel
+        return npimage, nplabel
 

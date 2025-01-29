@@ -22,8 +22,9 @@ from VGUNet import *
 from dataset import Dataset
 from baseline_model.vision_transformer import SwinUnet as ViT_seg
 from config import get_config
-from train import DISTRIBUTED, USE_AMP, COMPILE
+from train import DISTRIBUTED, USE_AMP
 
+COMPILE = False
 SAVE_GT = False
 
 def parse_args():
@@ -85,7 +86,7 @@ def process_output(output, img_paths, index, args, plt_test=False):
         index (int): Batch index for naming files.
         args: Additional arguments, including `args.name`.
     """
-    os.makedirs(f'datasets/BraTs2019/rgb_results/{args.name}/', exist_ok=True)
+    os.makedirs(f'local_datasets/BraTs2019/rgb_results/{args.name}/', exist_ok=True)
 
     for i, img_path in enumerate(img_paths):  # Handle each path in the list
         np_name = os.path.basename(img_path)
@@ -98,12 +99,12 @@ def process_output(output, img_paths, index, args, plt_test=False):
         }
         rgb_pic = create_rgb_image(output[i], (output.shape[2], output.shape[3], 3), label_mapping)
 
-        output_path = f'datasets/BraTs2019/rgb_results/{args.name}/{index*args.batch_size+i}.png'
+        output_path = f'local_datasets/BraTs2019/rgb_results/{args.name}/{index*args.batch_size+i}.png'
         imageio.imwrite(output_path, rgb_pic)
     
 
 def save_ground_truth(args, val_mask_paths, plt_test=False, select_index=None):
-    save_path = f'datasets/BraTs2019/rgb_results/{args.name}/'
+    save_path = f'local_datasets/BraTs2019/rgb_results/{args.name}/'
     os.makedirs(save_path, exist_ok=True)
     mask_paths = [val_mask_paths[select_index]] if plt_test else val_mask_paths
 
@@ -133,25 +134,23 @@ def main():
         print('%s: %s' %(arg, getattr(args, arg)))
     print('------------')
 
-    # create model
-    print("=> creating model %s" % args.name)
-    if args.name == "vgunet":
-        model = VGUNet.load(in_ch=4, out_ch=3)
-    model = model.cuda()
-
     # Data loading code
-    img_paths = glob(r'./datasets/BraTs2019/testImage/*')
-    mask_paths = glob(r'./datasets/BraTs2019/testMask/*')
+    img_paths = glob(r'./local_datasets/BraTs2019/testImage/*')
+    mask_paths = glob(r'./local_datasets/BraTs2019/testMask/*')
     val_img_paths = img_paths
     val_mask_paths = mask_paths
 
     print("testing mode:",args.mode)
     if args.mode == "GetPicture":
+            # create model
+        print("=> creating model %s" % args.name)
+        if args.name == "vgunet":
+            model = VGUNet.load(in_ch=4, out_ch=3)
         model = model.cuda()
         if DISTRIBUTED:
             model = nn.DataParallel(model)
         if COMPILE:
-            model = torch.compile(model)
+            model = torch.compile(model, mode="reduce-overhead")
         model.eval()
         test_dataset = Dataset(args, val_img_paths, val_mask_paths)
         plt_test = False
@@ -187,10 +186,10 @@ def main():
         Dice, Sensitivity, PPV
         """
 
-        maskPath = glob("./datasets/BraTs2019/rgb_results/vgunet/" + "*gt.png")
-        pbPath = glob("./datasets/BraTs2019/rgb_results/%s/" % args.name + "*.png")
+        maskPath = glob("./local_datasets/BraTs2019/rgb_results/vgunet/" + "*gt.png")
+        pbPath = glob("./local_datasets/BraTs2019/rgb_results/%s/" % args.name + "*.png")
         
-        saved_list = ["./datasets/BraTs2019/rgb_results/vgunet"]
+        saved_list = ["./local_datasets/BraTs2019/rgb_results/vgunet"]
         for model_path in saved_list:
             wt_dices = []
             tc_dices = []
@@ -211,7 +210,7 @@ def main():
                 print("请先生成图片!")
                 return
             for myi in tqdm(range(len(maskPath))):
-                mask = imread("./datasets/BraTs2019/rgb_results/vgunet/" + str(myi)+"gt.png")
+                mask = imread("./local_datasets/BraTs2019/rgb_results/vgunet/" + str(myi)+"gt.png")
                 pb = imread(model_path + "/" + str(myi) + ".png")
                 
                 wtmaskregion = (mask.sum(axis=-1) != 0).astype(np.float32)  # Any non-zero pixel
